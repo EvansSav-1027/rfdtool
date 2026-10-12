@@ -505,3 +505,13 @@ def test_disconnect_leaves_command_mode(qapp, mock_serial, session_radio):
     radio.close_port().result(timeout=5)
     assert b"AT&T\r\n" in mock_serial.written           # report off
     assert mock_serial.written.endswith(b"ATO\r\n")     # then back to data
+
+
+def test_remote_layout_matches_local_for_raw_names(tab, mc_dump):
+    # Raw firmware names (PIN0TYPE(13), PINMIRR) must not give the remote
+    # panel different row names from the local panel.
+    raw = proto.parse_ati5(FIXTURE.read_text())
+    tab._on_params_loaded(replace(raw, family=FAMILY_MULTICOMM), False)
+    tab._on_params_loaded(replace(raw, family=FAMILY_MULTICOMM), True)
+    assert tab._remote_panel.sreg_to_name() == tab._local_panel.sreg_to_name()
+    assert tab._remote_panel.sreg_to_name()[46] == "PINMIRROR"

@@ -1751,6 +1751,12 @@ class SettingsTab(QWidget):
         pin_names: dict[int, str] = getattr(result, "pin_names", {}) or {}
         family = str(getattr(result, "family", "") or FAMILY_SIK)
         meta = getattr(result, "s_meta", None)
+        if family == FAMILY_MULTICOMM:
+            # Raw MultiComm names carry pin annotations and abbreviations
+            # (PIN0TYPE(13), PINMIRR). Canonicalise here so both panels build
+            # identical rows, whichever read path produced the result.
+            s_names = multicomm.canonicalize_names(s_names)
+            pin_names = {}
         if not is_remote:
             self._set_family(family)
 
