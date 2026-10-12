@@ -31,10 +31,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from rfd import multicomm
 from rfd.diff import (
+    SEVERITY_CONFLICT,
     SEVERITY_MISSING_A,
     SEVERITY_MISSING_B,
     SEVERITY_OK,
+    SEVERITY_PER_NODE,
     SEVERITY_RF,
     SEVERITY_SOFT,
     SEVERITY_UART,
@@ -42,10 +45,12 @@ from rfd.diff import (
     diff_configs,
     summarise,
 )
-from rfd.registers import REGISTERS, get_spec
+from rfd.registers import FAMILY_MULTICOMM, get_spec
 
 
 _BG_BY_SEVERITY = {
+    SEVERITY_CONFLICT: "#f5b7b1",  # darker red
+    SEVERITY_PER_NODE: "#f4f6f7",  # neutral
     SEVERITY_RF: "#ffd6d6",     # red
     SEVERITY_SOFT: "#ffe4b5",   # amber
     SEVERITY_UART: "#e0f0ff",   # blue
@@ -55,6 +60,8 @@ _BG_BY_SEVERITY = {
 }
 
 _ICON_BY_SEVERITY = {
+    SEVERITY_CONFLICT: "⛔",
+    SEVERITY_PER_NODE: "·",
     SEVERITY_RF: "🔴",
     SEVERITY_SOFT: "🟡",
     SEVERITY_UART: "🔵",
@@ -64,6 +71,8 @@ _ICON_BY_SEVERITY = {
 }
 
 _LABEL_BY_SEVERITY = {
+    SEVERITY_CONFLICT: "Node conflict (must differ)",
+    SEVERITY_PER_NODE: "Per-node (may differ)",
     SEVERITY_RF: "RF-critical",
     SEVERITY_SOFT: "Link quality",
     SEVERITY_UART: "UART/GPIO",
@@ -77,6 +86,9 @@ def _format_value(reg, value):
     """Render a value the same way the editor would (enum label + numeric)."""
     if value is None:
         return "—"
+    if isinstance(value, tuple):
+        text = ",".join(map(str, value))
+        return text if len(text) <= 40 else text[:37] + "…"
     if reg is not None and reg.kind in ("enum", "bool") and reg.enum:
         label = reg.enum.get(value)
         if label is not None:
@@ -89,7 +101,7 @@ def _format_value(reg, value):
 class CompareConfigsDialog(QDialog):
     """Modal side-by-side diff with per-row and bulk fix actions."""
 
-    apply_fix_requested = Signal(int, int)             # sreg, value
+    apply_fix_requested = Signal(int, object)          # sreg, value
     apply_all_fixes_requested = Signal(object)         # list[(sreg, value)]
 
     def __init__(
@@ -102,6 +114,8 @@ class CompareConfigsDialog(QDialog):
         b_sregs: dict[str, int],
         *,
         title: str = "Compare configurations",
+        family: str | None = None,
+        peer: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -114,6 +128,10 @@ class CompareConfigsDialog(QDialog):
         self._entries = diff_configs(
             a_params, b_params,
             a_sregs=a_sregs, b_sregs=b_sregs,
+            family=family, peer=peer,
+        )
+        self._is_multicomm = family == FAMILY_MULTICOMM or multicomm.looks_like_multicomm(
+            names=list(a_params) + list(b_params),
         )
 
         root = QVBoxLayout(self)
@@ -175,19 +193,25 @@ class CompareConfigsDialog(QDialog):
     @staticmethod
     def _build_header(entries: list[CompareEntry]) -> QWidget:
         counts = summarise(entries)
+        conflicts = counts.get(SEVERITY_CONFLICT, 0)
         rf = counts.get(SEVERITY_RF, 0)
         soft = counts.get(SEVERITY_SOFT, 0)
         uart = counts.get(SEVERITY_UART, 0)
         miss = counts.get(SEVERITY_MISSING_A, 0) + counts.get(SEVERITY_MISSING_B, 0)
-        ok = counts.get(SEVERITY_OK, 0)
+        ok = counts.get(SEVERITY_OK, 0) + counts.get(SEVERITY_PER_NODE, 0)
 
-        if rf == 0 and soft == 0 and uart == 0 and miss == 0:
+        if conflicts == 0 and rf == 0 and soft == 0 and uart == 0 and miss == 0:
             text = (
                 f"<span style='color:#27ae60;font-weight:bold;'>"
                 f"✓ All {ok} parameter(s) match.</span>"
             )
         else:
             parts: list[str] = []
+            if conflicts:
+                parts.append(
+                    f"<span style='color:#922b21;font-weight:bold;'>"
+                    f"⛔ {conflicts} node conflict(s)</span>"
+                )
             if rf:
                 parts.append(
                     f"<span style='color:#c0392b;font-weight:bold;'>"
@@ -218,7 +242,10 @@ class CompareConfigsDialog(QDialog):
         row = QFrame()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(6, 3, 6, 3)
-        spec = get_spec(entry.name)
+        spec = (
+            multicomm.spec_for(-1, entry.name) if self._is_multicomm
+            else get_spec(entry.name)
+        )
 
         # Parameter label
         sreg = entry.sreg_a if entry.sreg_a is not None else entry.sreg_b
@@ -250,8 +277,12 @@ class CompareConfigsDialog(QDialog):
 
         # Action — Stage button when there's a mismatch and we have a sreg
         # to write to on side A (the local).
-        if entry.severity not in (SEVERITY_OK, SEVERITY_MISSING_B) and entry.sreg_a is not None and entry.value_b is not None:
-            btn = QPushButton(f"Stage {entry.value_b}")
+        # No "Stage" for per-node values or conflicts: copying the other
+        # node's NODEID/SLOTIDS would create (not fix) a collision.
+        if entry.severity not in (
+            SEVERITY_OK, SEVERITY_MISSING_B, SEVERITY_PER_NODE, SEVERITY_CONFLICT,
+        ) and entry.sreg_a is not None and entry.value_b is not None:
+            btn = QPushButton(f"Stage {_format_value(None, entry.value_b)}")
             btn.setToolTip(
                 f"Set local S{entry.sreg_a} to match the reference "
                 f"({entry.value_b})."
@@ -275,6 +306,6 @@ class CompareConfigsDialog(QDialog):
                 continue
             if entry.sreg_a is None or entry.value_b is None:
                 continue
-            bundle.append((entry.sreg_a, int(entry.value_b)))
+            bundle.append((entry.sreg_a, entry.value_b))
         if bundle:
             self.apply_all_fixes_requested.emit(bundle)

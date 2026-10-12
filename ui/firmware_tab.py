@@ -426,7 +426,9 @@ class FirmwareTab(QWidget):
         # Cross-check file kind against the detected board, if known.
         info = self._radio_info or {}
         board_id = info.get("board_id") if isinstance(info, dict) else None
-        if isinstance(board_id, int):
+        # Only cross-check boards we can classify: an unrecognised ID (e.g.
+        # a newer x2/ux2 variant) must not be assumed to be 8051.
+        if isinstance(board_id, int) and not board_name(board_id).startswith("Unknown"):
             board_kind = "stm32" if is_stm32_board(board_id) else "8051"
             if kind != board_kind:
                 ans = QMessageBox.warning(
@@ -497,24 +499,14 @@ class FirmwareTab(QWidget):
         # Drop into bootloader. The Radio object handles +++ then AT&UPDATE
         # and emits state_changed("bootloader") on success.
         self._append_log("requesting bootloader (AT&UPDATE)…")
-        try:
-            self._radio.enter_bootloader()
-        except Exception as e:
-            self._append_log(f"enter_bootloader failed: {e}")
-            self._flashing_kind = ""
-            QMessageBox.critical(self, "Firmware", f"enter_bootloader failed: {e}")
+        if not self._request_bootloader():
             return
 
-        # Brief wait for the radio to actually be in bootloader before we
-        # close the port and hand it off. We don't strictly *require* the
-        # state transition (stm32flash will retry sync), but logging it gives
-        # the user useful feedback.
-        self._wait_for_state(Radio.STATE_BOOTLOADER, timeout_ms=2000)
-
-        # stm32flash needs exclusive access to the port.
+        # stm32flash needs exclusive access to the port.  close_port is
+        # queued on the radio's worker — wait until it has actually run.
         self._append_log("releasing serial port for stm32flash…")
         try:
-            self._radio.close_port()
+            self._wait_future(self._radio.close_port(), timeout_ms=5000)
         except Exception as e:
             self._append_log(f"close_port: {e}")
 
@@ -557,15 +549,8 @@ class FirmwareTab(QWidget):
         )
         self._append_log(f"port={port}, baud={baud}")
         self._append_log("requesting bootloader (AT&UPDATE)…")
-        try:
-            self._radio.enter_bootloader()
-        except Exception as e:
-            self._append_log(f"enter_bootloader failed: {e}")
-            self._flashing_kind = ""
-            QMessageBox.critical(self, "Firmware", f"enter_bootloader failed: {e}")
+        if not self._request_bootloader():
             return
-
-        self._wait_for_state(Radio.STATE_BOOTLOADER, timeout_ms=2000)
 
         # The 8051 bootloader speaks the SiK custom protocol on the same
         # serial handle. Grab the underlying pyserial object via _core.
@@ -690,6 +675,46 @@ class FirmwareTab(QWidget):
         self._progress.setValue(0)
         self._progress.setFormat("%p%")
         self._log_view.clear()
+
+    def _wait_future(self, future, *, timeout_ms: int) -> bool:
+        """Keep the UI responsive until a queued Radio operation finishes."""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while future is not None and not future.done() and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        return future is None or future.done()
+
+    def _request_bootloader(self) -> bool:
+        """Send AT&UPDATE and wait until the radio is really in its
+        bootloader.  Entering command mode alone takes ≥2.2 s of +++ guard
+        time; starting the uploader before that finishes would trample
+        the escape sequence on the shared serial port."""
+        try:
+            future = self._radio.enter_bootloader()
+            self._wait_future(future, timeout_ms=15000)
+        except Exception as e:
+            self._append_log(f"enter_bootloader failed: {e}")
+            future = None
+        # Let the queued state_changed("bootloader") reach this thread.
+        if self._wait_for_state(Radio.STATE_BOOTLOADER, timeout_ms=1000):
+            return True
+        # No AT reply.  That's expected when recovering a radio held in its
+        # bootloader by the BOOT pin, so offer to carry on rather than abort.
+        ans = QMessageBox.question(
+            self, "Firmware",
+            "The radio did not confirm entering its bootloader (AT&UPDATE "
+            "got no reply).\n\nIf you are recovering a radio by holding its "
+            "BOOT pin, it is already in the bootloader — continue flashing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._append_log("no bootloader confirmation — continuing (BOOT-pin recovery)")
+            self._radio.assume_bootloader()
+            return True
+        self._flashing_kind = ""
+        self._append_log("radio did not enter the bootloader — aborted, nothing flashed")
+        return False
 
     def _wait_for_state(self, target: str, *, timeout_ms: int) -> bool:
         """Spin the event loop briefly waiting for the radio to reach ``target``.

@@ -75,7 +75,15 @@ def test_R3_too_many_channels():
 
 # ------------------------------------------------------------ R4
 
-def test_R4_txpower_exceeds_model_cap_RFD900p():
+def test_R4_rfd900p_allows_1w():
+    # Every RFD900 variant is rated to 30 dBm — no model-cap error.
+    report = validate_config({4: 30}, board_name="RFD900p")
+    assert not any(i.sregs == (4,) and "RFD900p" in i.title for i in report.errors)
+
+
+def test_R4_txpower_exceeds_model_cap(monkeypatch):
+    from rfd import regions
+    monkeypatch.setitem(regions.MODEL_MAX_TXPOWER, "RFD900p", 27)
     report = validate_config({4: 30}, board_name="RFD900p")
     r4 = [i for i in report.errors
           if i.sregs == (4,) and "RFD900p" in i.title]

@@ -1,10 +1,15 @@
 """Two-panel S-register editor for local + remote RFD900 radios.
 
-Renders every S-register (S0..S15) and pin-mapping register (R0..R15) for both
-the local and the remote radio, side-by-side, as live editor widgets bound to
-a :class:`rfd.radio.Radio`. Loads parameters via ATI5/RTI5, tracks per-row
+Renders every S-register and pin-mapping register (R0..R15) for both the
+local and the remote radio, side-by-side, as live editor widgets bound to a
+:class:`rfd.radio.Radio`. Loads parameters via ATI5/RTI5, tracks per-row
 dirty state, and writes only the modified registers on demand. Built-in
 profiles and JSON profile import/export are exposed via a Profiles menu.
+
+Works with SiK and RFD MultiComm firmware.  For MultiComm the rows are
+grouped into sections, array registers and the 64-bit SLOTIDS mask get text
+editors, ranges come from the radio itself (ATI10), and a node selector
+addresses RT commands to one NODEID.
 """
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -37,6 +43,7 @@ from rfd.presets import (
     BUILT_IN_PRESETS,
     CATEGORY_MAXIMIZE,
     CATEGORY_MODEL,
+    CATEGORY_MULTICOMM,
     CATEGORY_REGION,
     CATEGORY_USE_CASE,
     Profile,
@@ -49,18 +56,21 @@ from rfd.presets import (
     save_user_profile,
     user_profile_dir,
 )
+from rfd import multicomm
 from rfd.radio import Radio
 from rfd.registers import (
     CANONICAL_PIN_NAMES,
     CANONICAL_SIK_NAMES,
-    PIN_REGISTERS,
-    REGISTERS,
+    FAMILY_MULTICOMM,
+    FAMILY_SIK,
+    ParamMeta,
+    ParamValue,
     RegisterDef,
     all_pin_registers,
     all_registers,
+    coerce_value,
     derive_def,
-    validate,
-    validate_value,
+    validate_def,
 )
 from rfd.validation import ValidationReport, validate_config
 
@@ -96,29 +106,58 @@ class _Row:
     editor: QWidget
     dirty_marker: QLabel
     status_marker: QLabel
+    units_label: QLabel | None = None
     is_dirty: bool = False
     validation_severity: str = ""   # "" | "error" | "warning" | "info" | "ok"
     validation_titles: tuple[str, ...] = ()
 
-    def value(self) -> int:
+    def value(self) -> ParamValue | None:
+        """Current editor value, or None if a text editor holds something
+        that doesn't parse (the save path reports that row)."""
         if isinstance(self.editor, QSpinBox):
             return int(self.editor.value())
         if isinstance(self.editor, QComboBox):
             data = self.editor.currentData()
             return int(data) if data is not None else 0
+        if isinstance(self.editor, QLineEdit):
+            text = self.editor.text().strip()
+            try:
+                if self.reg.kind == "list":
+                    return coerce_value(text.rstrip(",") + ",") if text else ()
+                # Decimal, or 0x-hex for masks; int(text, 0) would reject
+                # leading zeros like "08".
+                return int(text, 16) if text[:2].lower() == "0x" else int(text)
+            except ValueError:
+                return None
         return 0
 
-    def set_value(self, value: int) -> None:
+    def refresh_hint(self) -> None:
+        """Live description next to the SLOTIDS mask editor."""
+        if self.reg.kind != "bitmask" or self.units_label is None:
+            return
+        v = self.value()
+        self.units_label.setText(
+            multicomm.describe_slots(v) if isinstance(v, int) else "invalid"
+        )
+
+    def set_value(self, value: ParamValue) -> None:
         # Block signals so programmatic updates from the radio don't mark the
         # row dirty.
         self.editor.blockSignals(True)
         try:
-            if isinstance(self.editor, QSpinBox):
+            if isinstance(self.editor, QLineEdit):
+                if isinstance(value, tuple):
+                    self.editor.setText(",".join(str(v) for v in value))
+                else:
+                    self.editor.setText(str(int(value)))
+                self.refresh_hint()
+            elif isinstance(self.editor, QSpinBox):
                 v = int(value)
                 # Auto-expand the spinbox range if the radio reports a value
                 # outside our current bounds (e.g. newer firmware widening a
                 # register that used to cap lower). Without this the QSpinBox
                 # silently clips and the user sees a stale display value.
+                v = max(_INT32_MIN, min(v, _INT32_MAX))
                 if v < self.editor.minimum():
                     self.editor.setMinimum(v)
                 if v > self.editor.maximum():
@@ -161,12 +200,15 @@ class _Row:
             self.status_marker.setToolTip("")
 
 
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+
+
 def _make_editor(reg: RegisterDef, parent: QWidget) -> QWidget:
     """Build the editor widget appropriate for ``reg.kind``."""
-    if reg.kind == "int":
+    lo = reg.minimum if reg.minimum is not None else 0
+    hi = reg.maximum if reg.maximum is not None else 0xFFFF
+    if reg.kind == "int" and _INT32_MIN <= lo and hi <= _INT32_MAX:
         sb = QSpinBox(parent)
-        lo = reg.minimum if reg.minimum is not None else 0
-        hi = reg.maximum if reg.maximum is not None else 0xFFFF
         sb.setRange(int(lo), int(hi))
         if reg.default is not None:
             sb.setValue(int(reg.default))
@@ -202,6 +244,29 @@ def _make_editor(reg: RegisterDef, parent: QWidget) -> QWidget:
             cb.setEnabled(False)
         return cb
 
+    if reg.kind in ("list", "bitmask", "int"):
+        # "int" lands here only when its range exceeds QSpinBox's int32.
+        # Arrays (MultiComm ENCRYPTKEY, RCDEFS…) and SLOTIDS (64-bit, beyond
+        # QSpinBox's int32) are edited as text.
+        le = QLineEdit(parent)
+        if reg.kind == "list":
+            le.setPlaceholderText(
+                f"{reg.length or ''} comma-separated values "
+                f"({reg.minimum}..{reg.maximum})".strip()
+            )
+        elif reg.kind == "bitmask":
+            le.setPlaceholderText("decimal bitmask (bit 0 = slot 1)")
+        else:
+            le.setPlaceholderText(f"integer {reg.minimum}..{reg.maximum}")
+        if reg.default is not None:
+            default = reg.default
+            le.setText(
+                ",".join(map(str, default)) if isinstance(default, tuple) else str(default)
+            )
+        le.setToolTip(reg.tooltip)
+        le.setReadOnly(reg.read_only)
+        return le
+
     # Fallback — never expected, but keep the UI alive if a new kind appears.
     fallback = QLabel(f"<unsupported kind {reg.kind!r}>", parent)
     fallback.setEnabled(False)
@@ -232,6 +297,10 @@ class _RegisterPanel(QWidget):
         self._pin_name_to_sreg: dict[str, int] = {
             n: s for s, n in self._pin_sreg_to_name.items()
         }
+        self._family: str = FAMILY_SIK
+        self._meta: dict[int, ParamMeta] = {}
+        # Section header labels (MultiComm) — deleted on every rebuild.
+        self._headers: list[QWidget] = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -311,6 +380,8 @@ class _RegisterPanel(QWidget):
 
         units = QLabel(reg.units or "", row_widget)
         units.setMinimumWidth(40)
+        if reg.kind == "bitmask":
+            units.setMinimumWidth(150)
 
         dirty = QLabel("", row_widget)
         dirty.setStyleSheet("color: #c0392b; font-weight: bold;")
@@ -329,8 +400,9 @@ class _RegisterPanel(QWidget):
         # focus events bubble up as "this panel is active".
         row = _Row(
             reg.sreg, is_pin, reg, row_widget,
-            label, editor, dirty, status,
+            label, editor, dirty, status, units,
         )
+        row.refresh_hint()
         self._wire_editor(row)
         # Track interaction by hooking focus events on the editor.
         editor.installEventFilter(_FocusReporter(self))
@@ -349,6 +421,10 @@ class _RegisterPanel(QWidget):
             row.editor.valueChanged.connect(emit_changed)
         elif isinstance(row.editor, QComboBox):
             row.editor.currentIndexChanged.connect(emit_changed)
+        elif isinstance(row.editor, QLineEdit):
+            # textEdited fires for user edits only, never for setText().
+            row.editor.textEdited.connect(emit_changed)
+            row.editor.textEdited.connect(lambda *_a: row.refresh_hint())
 
     # ---------------------------------------------------------------- public
     def rows(self) -> dict[tuple[int, bool], _Row]:
@@ -360,15 +436,59 @@ class _RegisterPanel(QWidget):
     def is_remote(self) -> bool:
         return self._is_remote
 
+    def family(self) -> str:
+        return self._family
+
+    def meta(self) -> dict[int, ParamMeta]:
+        return dict(self._meta)
+
+    def reg_defs(self) -> dict[int, RegisterDef]:
+        """sreg → the row's RegisterDef (S-registers only)."""
+        return {s: r.reg for (s, p), r in self._rows.items() if not p}
+
+    def s_values(self, *, include_read_only: bool = True) -> dict[int, ParamValue]:
+        """sreg → current editor value for every parseable S-register row."""
+        out: dict[int, ParamValue] = {}
+        for (sreg, is_pin), row in self._rows.items():
+            if is_pin or (row.reg.read_only and not include_read_only):
+                continue
+            v = row.value()
+            if v is not None:
+                out[sreg] = v
+        return out
+
+    def pin_values(self) -> dict[int, int]:
+        out: dict[int, int] = {}
+        for (sreg, is_pin), row in self._rows.items():
+            v = row.value() if is_pin else None
+            if isinstance(v, int):
+                out[sreg] = v
+        return out
+
+    def named_values(self) -> dict[str, ParamValue]:
+        """Parameter name → value for writable S-registers (for profiles)."""
+        return {
+            self._sreg_to_name[s]: v
+            for s, v in self.s_values(include_read_only=False).items()
+            if s in self._sreg_to_name
+        }
+
     def apply_values(
         self,
-        s_params: dict[int, int],
-        pin_params: dict[int, int] | None = None,
+        s_params: dict[int, ParamValue],
+        pin_params: dict[int, ParamValue] | None = None,
         *,
         s_names: dict[int, str] | None = None,
         pin_names: dict[int, str] | None = None,
+        family: str | None = None,
+        meta: dict[int, ParamMeta] | None = None,
+        keep_dirty: bool = False,
     ) -> None:
         """Update row values from a fresh ATI5 read.
+
+        With ``keep_dirty`` rows holding unsaved user edits keep them — used
+        for background re-reads (Compare, Export) so they can't silently
+        discard work in progress.
 
         If ``s_names`` / ``pin_names`` are supplied (typically from
         ``Ati5Result``), the panel rebuilds its rows to match the firmware's
@@ -376,10 +496,25 @@ class _RegisterPanel(QWidget):
         ``S14: MAX_WINDOW`` instead of the canonical ``S14: RTSCTS``
         labelling.  Existing values are preserved across the rebuild.
         """
-        if s_names is not None and s_names != self._sreg_to_name:
+        family = family or self._family
+        meta = self._meta if meta is None else meta
+        if (
+            (s_names is not None and s_names != self._sreg_to_name)
+            or family != self._family
+            or meta != self._meta
+        ):
+            if pin_names is None:
+                # MultiComm has no R-registers; SiK gets the canonical set
+                # back even if the previous radio was MultiComm.
+                pin_names = (
+                    {} if family == FAMILY_MULTICOMM
+                    else self._pin_sreg_to_name or dict(CANONICAL_PIN_NAMES)
+                )
             self._rebuild_layout(
-                s_names=s_names,
-                pin_names=pin_names if pin_names is not None else self._pin_sreg_to_name,
+                s_names=s_names if s_names is not None else self._sreg_to_name,
+                pin_names=pin_names,
+                family=family,
+                meta=meta,
             )
         elif pin_names is not None and pin_names != self._pin_sreg_to_name:
             self._rebuild_layout(
@@ -394,12 +529,16 @@ class _RegisterPanel(QWidget):
                 # add it on the fly. Edge case; shouldn't normally hit.
                 continue
             if row is not None:
+                if keep_dirty and (sreg, False) in self._dirty:
+                    continue
                 row.set_value(value)
                 self._mark_clean(sreg, False)
         if pin_params:
             for sreg, value in pin_params.items():
                 row = self._rows.get((sreg, True))
                 if row is not None:
+                    if keep_dirty and (sreg, True) in self._dirty:
+                        continue
                     row.set_value(value)
                     self._mark_clean(sreg, True)
 
@@ -409,6 +548,8 @@ class _RegisterPanel(QWidget):
         *,
         s_names: dict[int, str],
         pin_names: dict[int, str],
+        family: str | None = None,
+        meta: dict[int, ParamMeta] | None = None,
     ) -> None:
         """Replace the S/R row widgets with ones reflecting `s_names` /
         `pin_names`.  Preserves dirty state where the sreg still exists in
@@ -419,11 +560,15 @@ class _RegisterPanel(QWidget):
         rows under it don't get cascade-deleted out from under their dict
         references.
         """
-        dirty_snapshot: dict[tuple[int, bool], int] = {}
+        # Keyed by (name, is_pin), not sreg: the same sreg can mean a
+        # different parameter in the new layout (SiK S1 SERIAL_SPEED vs
+        # MultiComm S1 BITRATE; canonical vs RFDesign 3.x S13..S15).
+        dirty_snapshot: dict[tuple[str, bool], ParamValue] = {}
         for key in list(self._dirty):
             row = self._rows.get(key)
-            if row is not None:
-                dirty_snapshot[key] = row.value()
+            if row is not None and row.value() is not None:
+                dirty_snapshot[(row.reg.name, key[1])] = row.value()  # type: ignore[assignment]
+        old_family = self._family
 
         # Remove only the row containers we created. body_layout's
         # pin_group + stretch stay; pin_layout has only row containers
@@ -433,8 +578,17 @@ class _RegisterPanel(QWidget):
             parent_layout.removeWidget(row.container)
             row.container.setParent(None)
             row.container.deleteLater()
+        for header in self._headers:
+            self._body_layout.removeWidget(header)
+            header.setParent(None)
+            header.deleteLater()
+        self._headers.clear()
         self._rows.clear()
         self._dirty.clear()
+        if family is not None:
+            self._family = family
+        if meta is not None:
+            self._meta = dict(meta)
 
         self._sreg_to_name = dict(s_names)
         self._name_to_sreg = {n: s for s, n in self._sreg_to_name.items()}
@@ -447,13 +601,29 @@ class _RegisterPanel(QWidget):
         if pin_group_idx < 0:
             pin_group_idx = self._body_layout.count()
         insert_at = pin_group_idx
-        for sreg in sorted(self._sreg_to_name.keys()):
-            name = self._sreg_to_name[sreg]
-            reg = derive_def(sreg, name)
+        defs = [
+            derive_def(sreg, name, family=self._family, meta=self._meta.get(sreg))
+            for sreg, name in sorted(self._sreg_to_name.items())
+        ]
+        grouped = self._family == FAMILY_MULTICOMM
+        if grouped:
+            # Section order, then sreg within a section; unknown last.
+            order = {g: i for i, g in enumerate(_MULTICOMM_GROUP_ORDER)}
+            defs.sort(key=lambda d: (order.get(d.group, len(order)), d.sreg))
+        current_group: str | None = None
+        for reg in defs:
+            if grouped and reg.group != current_group:
+                current_group = reg.group
+                header = QLabel(f"<b>{reg.group or 'Other'}</b>", self._body)
+                header.setStyleSheet("color: #2c3e50; padding-top: 6px;")
+                self._body_layout.insertWidget(insert_at, header)
+                self._headers.append(header)
+                insert_at += 1
             row_widget, row = self._build_row(reg, is_pin=False, parent=self._body)
             self._body_layout.insertWidget(insert_at, row_widget)
             insert_at += 1
-            self._rows[(sreg, False)] = row
+            self._rows[(reg.sreg, False)] = row
+        self._pin_group.setVisible(bool(self._pin_sreg_to_name))
 
         for sreg in sorted(self._pin_sreg_to_name.keys()):
             name = self._pin_sreg_to_name[sreg]
@@ -470,11 +640,14 @@ class _RegisterPanel(QWidget):
             self._pin_layout.addWidget(row_widget)
             self._rows[(sreg, True)] = row
 
-        for (sreg, is_pin), value in dirty_snapshot.items():
-            row = self._rows.get((sreg, is_pin))
-            if row is not None:
-                row.set_value(value)
-                self._mark_dirty(sreg, is_pin)
+        if self._family != old_family:
+            return   # names from another firmware family don't carry over
+        by_name = {(r.reg.name, p): (s, p) for (s, p), r in self._rows.items()}
+        for name_key, value in dirty_snapshot.items():
+            key = by_name.get(name_key)
+            if key is not None:
+                self._rows[key].set_value(value)
+                self._mark_dirty(*key)
 
     def sreg_to_name(self) -> dict[int, str]:
         return dict(self._sreg_to_name)
@@ -498,14 +671,14 @@ class _RegisterPanel(QWidget):
                 continue
             if row.reg.default is None:
                 continue
-            row.set_value(int(row.reg.default))
+            row.set_value(row.reg.default)
             self._mark_dirty(sreg, is_pin)
 
-    def get_value(self, sreg: int, is_pin: bool = False) -> int | None:
+    def get_value(self, sreg: int, is_pin: bool = False) -> ParamValue | None:
         row = self._rows.get((sreg, is_pin))
         return None if row is None else row.value()
 
-    def set_value(self, sreg: int, value: int, is_pin: bool = False) -> None:
+    def set_value(self, sreg: int, value: ParamValue, is_pin: bool = False) -> None:
         row = self._rows.get((sreg, is_pin))
         if row is None:
             return
@@ -565,6 +738,19 @@ class _RegisterPanel(QWidget):
             row.apply_visual()
 
 
+_MULTICOMM_GROUP_ORDER: tuple[str, ...] = (
+    multicomm.GROUP_LINK,
+    multicomm.GROUP_NETWORK,
+    multicomm.GROUP_ROUTING,
+    multicomm.GROUP_ENCRYPTION,
+    multicomm.GROUP_SERIAL1,
+    multicomm.GROUP_SERIAL2,
+    multicomm.GROUP_GPIO,
+    multicomm.GROUP_RC,
+    multicomm.GROUP_MISC,
+)
+
+
 class _FocusReporter(QWidget):
     """Tiny event filter that re-emits focus-in as the panel's `interacted`."""
 
@@ -601,6 +787,10 @@ class SettingsTab(QWidget):
         self._save_failures: int = 0
         self._save_rejected: list[tuple[str, int, int]] = []  # (label, sreg, value) for regs the radio said ERROR to
 
+        # Sides whose next params_loaded comes from a fresh connection and
+        # should overwrite (not merge with) unsaved edits.
+        self._overwrite_next: set[bool] = set()
+
         # EEPROM save tracking.
         self._eeprom_pending: set[bool] = set()  # set of is_remote flags
 
@@ -612,9 +802,10 @@ class SettingsTab(QWidget):
         # powers firmware-lockdown detection (R19).
         self._board_name: str = ""
         self._firmware_banner: str = ""
+        self._family: str = FAMILY_SIK
         # The radio's last-known values.  Populated by params_loaded events;
         # R19 needs this to detect "user wants X but radio is locked at Y".
-        self._radio_current_values: dict[int, int] = {}
+        self._radio_current_values: dict[int, ParamValue] = {}
 
         self._build_ui()
         self._wire_radio()
@@ -649,6 +840,20 @@ class SettingsTab(QWidget):
         self._populate_profiles_menu()
         self._btn_profiles.setMenu(self._profiles_menu)
 
+        # MultiComm: which NODEID RT commands (remote panel) talk to.
+        self._node_label = QLabel("Remote node:", self)
+        self._node_spin = QSpinBox(self)
+        self._node_spin.setRange(-1, multicomm.MAX_NODEID)
+        self._node_spin.setSpecialValueText("all (broadcast)")
+        self._node_spin.setValue(-1)
+        self._node_spin.setToolTip(
+            "MultiComm sends RT commands to every node in range unless one is "
+            "addressed (RTI5@N). Pick the NODEID the REMOTE panel should read "
+            "and write. 'all' is fine for a point-to-point pair, but in a "
+            "network every node would answer at once."
+        )
+        self._node_spin.valueChanged.connect(self._on_remote_node_changed)
+
         # Compact summary label that shows the last validation tally.
         self._validation_status = QLabel("", self)
         self._validation_status.setStyleSheet("color: #555;")
@@ -665,6 +870,8 @@ class SettingsTab(QWidget):
         ):
             actions.addWidget(btn)
         actions.addWidget(self._btn_profiles)
+        actions.addWidget(self._node_label)
+        actions.addWidget(self._node_spin)
         actions.addWidget(self._validation_status)
         actions.addStretch(1)
         root.addLayout(actions)
@@ -697,6 +904,37 @@ class SettingsTab(QWidget):
         self._btn_eeprom.clicked.connect(self._on_save_eeprom_clicked)
         self._btn_reboot.clicked.connect(self._on_reboot_clicked)
         self._btn_factory.clicked.connect(self._on_factory_reset_clicked)
+        self._apply_family_ui()
+
+    def _apply_family_ui(self) -> None:
+        """Show/hide controls that only make sense for one firmware family."""
+        is_mc = self._family == FAMILY_MULTICOMM
+        self._node_label.setVisible(is_mc)
+        self._node_spin.setVisible(is_mc)
+        if not is_mc and self._node_spin.value() != -1:
+            # A hidden, stale node selection must not follow us to SiK.
+            self._node_spin.setValue(-1)
+        self._btn_eeprom.setToolTip(
+            "MultiComm saves every parameter as it is written — there is no "
+            "AT&W. Reboot the radios to apply changes."
+            if is_mc else
+            "Write the current settings to EEPROM (AT&W) on local and remote."
+        )
+
+    def _on_remote_node_changed(self, value: int) -> None:
+        node = None if value < 0 else value
+        self._radio.set_remote_node(node)
+        # The REMOTE panel shows the previous node's values; drop its
+        # unsaved edits and grey it out until the new node is loaded, so
+        # one node's settings can't be saved onto another.
+        self._remote_panel.mark_all_clean()
+        self._remote_panel.setEnabled(False)
+        self._emit_status(
+            "Remote panel addresses all nodes (broadcast)." if node is None
+            else f"Remote panel addresses NODEID {node} (RT…@{node}). "
+                 "Click Load Settings to read it.",
+            5000,
+        )
 
     def _populate_profiles_menu(self) -> None:
         """(Re)build the Profiles dropdown.
@@ -707,11 +945,17 @@ class SettingsTab(QWidget):
         """
         self._profiles_menu.clear()
 
-        category_layout = (
+        sik_layout = (
             (CATEGORY_REGION,    "Region & frequency"),
             (CATEGORY_USE_CASE,  "Use case"),
             (CATEGORY_MODEL,     "Model defaults"),
             (CATEGORY_MAXIMIZE,  "Maximize (combos)"),
+        )
+        mc_layout = ((CATEGORY_MULTICOMM, "MultiComm"),)
+        # Presets for the connected firmware first.
+        category_layout = (
+            mc_layout + sik_layout if self._family == FAMILY_MULTICOMM
+            else sik_layout + mc_layout
         )
         for category, label in category_layout:
             sub = self._profiles_menu.addMenu(label)
@@ -777,12 +1021,17 @@ class SettingsTab(QWidget):
         *,
         is_user: bool = False,
     ) -> None:
-        applies = preset.matches_board(self._board_name)
-        text = preset.name if applies else f"{preset.name}  (n/a for {self._board_name})"
+        board_ok = preset.matches_board(self._board_name)
+        fw_ok = preset.matches_firmware(self._family)
+        applies = board_ok and fw_ok
+        target = self._board_name if not board_ok else (
+            "MultiComm" if self._family == FAMILY_MULTICOMM else "SiK"
+        )
+        text = preset.name if applies else f"{preset.name}  (n/a for {target})"
         act = QAction(text, menu)
         tip = preset.description
         if not applies:
-            tip += f"  · This preset isn't tagged for {self._board_name}."
+            tip += f"  · This preset isn't meant for {target} radios."
         if preset.notes:
             tip += f"\n\n{preset.notes}"
         act.setToolTip(tip)
@@ -798,6 +1047,7 @@ class SettingsTab(QWidget):
     def _wire_radio(self) -> None:
         self._radio.state_changed.connect(self._on_state_changed)
         self._radio.params_loaded.connect(self._on_params_loaded)
+        self._radio.params_failed.connect(self._on_params_failed)
         self._radio.write_result.connect(self._on_write_result)
         self._radio.eeprom_saved.connect(self._on_eeprom_saved)
         self._radio.factory_reset_done.connect(self._on_factory_reset_done)
@@ -810,12 +1060,23 @@ class SettingsTab(QWidget):
         try:
             self._board_name = str(info.get("board_name") or "")  # type: ignore[union-attr]
             self._firmware_banner = str(info.get("banner") or "")  # type: ignore[union-attr]
+            self._set_family(str(info.get("firmware_family") or FAMILY_SIK))  # type: ignore[union-attr]
         except Exception:
             self._board_name = ""
             self._firmware_banner = ""
 
+    def _set_family(self, family: str) -> None:
+        if family != self._family:
+            self._family = family
+            self._apply_family_ui()
+
     # ---------------------------------------------------------------- state handling
     def _on_state_changed(self, state: str) -> None:
+        if self._state == Radio.STATE_DISCONNECTED and state != Radio.STATE_DISCONNECTED:
+            # New connection — possibly a different radio.  The connect-time
+            # reads replace whatever was staged for the previous one.
+            self._overwrite_next = {False, True}
+            self._remote_panel.setEnabled(True)
         self._state = state
         self._set_buttons_enabled(state in _LIVE_STATES)
 
@@ -859,15 +1120,20 @@ class SettingsTab(QWidget):
         # Batch local and remote writes into one round-trip each — staying in
         # command mode for the whole set is dramatically faster than doing
         # one +++/ATO bracket per register, and also avoids serial races.
-        local_batch: list[tuple[int, int, bool, bool]] = []
-        remote_batch: list[tuple[int, int, bool, bool]] = []
+        local_batch: list[tuple[int, ParamValue, bool, bool]] = []
+        remote_batch: list[tuple[int, ParamValue, bool, bool]] = []
 
         for panel in (self._local_panel, self._remote_panel):
             is_remote = panel.is_remote()
             for sreg, is_pin in sorted(panel.dirty()):
                 row = panel.rows()[(sreg, is_pin)]
                 value = row.value()
-                ok, reason = validate(sreg, value, pin=is_pin)
+                if value is None:
+                    skipped.append(f"S{sreg} {row.reg.name}: not a valid value")
+                    continue
+                # Validate against this row's own definition — correct for
+                # any firmware layout (canonical SiK sregs are not).
+                ok, reason = validate_def(row.reg, value)
                 if not ok:
                     skipped.append(reason)
                     continue
@@ -879,6 +1145,8 @@ class SettingsTab(QWidget):
         if skipped:
             for reason in skipped:
                 self._emit_status(reason, 6000)
+
+        remote_batch = self._guard_broadcast_writes(remote_batch)
 
         attempted = len(local_batch) + len(remote_batch)
         if attempted == 0:
@@ -892,24 +1160,65 @@ class SettingsTab(QWidget):
             self._radio.write_params_batch(remote_batch)
         self._emit_status(f"Saving {attempted} register(s)…", 3000)
 
+    def _guard_broadcast_writes(
+        self, remote_batch: list[tuple[int, ParamValue, bool, bool]],
+    ) -> list[tuple[int, ParamValue, bool, bool]]:
+        """MultiComm with no node selected broadcasts RT writes to every
+        node.  Per-node settings (NODEID, SLOTIDS, DESTID…) written that way
+        would make every node identical — confirm first, else drop them."""
+        if self._family != FAMILY_MULTICOMM or self._radio.remote_node is not None:
+            return remote_batch
+        rows = self._remote_panel.rows()
+        per_node = [
+            u for u in remote_batch
+            if not u[3] and rows.get((u[0], False)) is not None
+            and rows[(u[0], False)].reg.scope != "network"
+        ]
+        if not per_node:
+            return remote_batch
+        names = ", ".join(rows[(u[0], False)].reg.name for u in per_node)
+        ans = QMessageBox.warning(
+            self,
+            "Broadcast per-node settings?",
+            f"No remote node is selected, so these per-node settings would be "
+            f"written to EVERY node in range: {names}.\n\n"
+            "Select a node (Remote node: …) to write just one. Send them to "
+            "all nodes anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            return remote_batch
+        for u in per_node:
+            self._save_pending.discard((u[0], True, u[3]))
+        return [u for u in remote_batch if u not in per_node]
+
     def _on_copy_to_remote_clicked(self) -> None:
+        # MultiComm: copy only "same for all nodes" settings — per-node ones
+        # (NODEID, SLOTIDS, DESTID…) must stay different on each node.
+        network_only = self._family == FAMILY_MULTICOMM
         copied = 0
-        for sreg in sorted(REGISTERS.keys()):
-            reg = REGISTERS[sreg]
-            if reg.read_only:
+        remote_rows = self._remote_panel.rows()
+        for (sreg, is_pin), row in sorted(self._local_panel.rows().items()):
+            if is_pin or row.reg.read_only:
                 continue
-            local_val = self._local_panel.get_value(sreg, is_pin=False)
-            if local_val is None:
+            if network_only and row.reg.scope != "network":
                 continue
-            remote_val = self._remote_panel.get_value(sreg, is_pin=False)
-            if remote_val == local_val:
+            local_val = row.value()
+            remote_row = remote_rows.get((sreg, False))
+            if local_val is None or remote_row is None or remote_row.reg.name != row.reg.name:
+                continue
+            if remote_row.value() == local_val:
                 continue
             self._remote_panel.set_value(sreg, local_val, is_pin=False)
             copied += 1
+        scope = " network-wide" if network_only else ""
         if copied:
-            self._emit_status(f"Copied {copied} register(s) to remote panel (unsaved).", 5000)
+            self._emit_status(
+                f"Copied {copied}{scope} register(s) to remote panel (unsaved).", 5000,
+            )
         else:
-            self._emit_status("Remote already matches local.", 4000)
+            self._emit_status(f"Remote already matches local{scope} settings.", 4000)
 
     def _on_restore_defaults_clicked(self) -> None:
         panel = self._active_panel or self._local_panel
@@ -918,6 +1227,14 @@ class SettingsTab(QWidget):
         self._emit_status(f"Restored defaults on {side} panel (unsaved).", 5000)
 
     def _on_save_eeprom_clicked(self) -> None:
+        if self._family == FAMILY_MULTICOMM:
+            QMessageBox.information(
+                self, "Save to EEPROM",
+                "MultiComm firmware saves each parameter as soon as it is "
+                "written (there is no AT&W). Use Reboot to make the new "
+                "settings take effect.",
+            )
+            return
         ans = QMessageBox.question(
             self,
             "Save to EEPROM",
@@ -946,10 +1263,17 @@ class SettingsTab(QWidget):
         self._radio.reboot(False)
         self._emit_status("Rebooting local radio…", 3000)
 
+        node = self._radio.remote_node
+        remote_desc = (
+            "EVERY remote node in range (no node selected)"
+            if self._family == FAMILY_MULTICOMM and node is None
+            else f"remote NODEID {node}" if self._family == FAMILY_MULTICOMM
+            else "the REMOTE radio"
+        )
         ans2 = QMessageBox.question(
             self,
             "Reboot remote radio",
-            "Also reboot the REMOTE radio?",
+            f"Also reboot {remote_desc}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -974,19 +1298,14 @@ class SettingsTab(QWidget):
     # ---------------------------------------------------------------- profile actions
     def _apply_profile(self, profile: Profile) -> None:
         """Show the confirm-and-diff dialog, then stage values on the local panel."""
-        current_values: dict[int, int] = {}
-        for (sreg, is_pin) in self._local_panel.rows():
-            if is_pin:
-                continue
-            v = self._local_panel.get_value(sreg, is_pin=False)
-            if v is not None:
-                current_values[sreg] = int(v)
         dialog = ApplyPresetDialog(
             profile,
-            current_values,
+            self._local_panel.s_values(),
             board_name=self._board_name,
             name_to_sreg=self._local_panel.name_to_sreg(),
             sreg_to_name=self._local_panel.sreg_to_name(),
+            reg_defs=self._local_panel.reg_defs(),
+            family=self._family,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1009,7 +1328,7 @@ class SettingsTab(QWidget):
             row = self._local_panel.rows().get((int(sreg), False))
             if row is None or row.reg.read_only:
                 continue
-            self._local_panel.set_value(int(sreg), int(value), is_pin=False)
+            self._local_panel.set_value(int(sreg), coerce_value(value), is_pin=False)
             applied += 1
         for sreg, value in profile.pin_registers.items():
             row = self._local_panel.rows().get((int(sreg), True))
@@ -1029,25 +1348,16 @@ class SettingsTab(QWidget):
 
     # ---------------------------------------------------------------- validation
     def _on_validate_clicked(self) -> None:
-        s_params: dict[int, int] = {}
-        for sreg in REGISTERS.keys():
-            v = self._local_panel.get_value(sreg, is_pin=False)
-            if v is not None:
-                s_params[sreg] = int(v)
-        pin_params: dict[int, int] = {}
-        for sreg in PIN_REGISTERS.keys():
-            v = self._local_panel.get_value(sreg, is_pin=True)
-            if v is not None:
-                pin_params[sreg] = int(v)
-
         report = validate_config(
-            s_params,
+            self._local_panel.s_values(),
             sreg_to_name=self._local_panel.sreg_to_name(),
-            pin_params=pin_params,
+            pin_params=self._local_panel.pin_values(),
             board_name=self._board_name,
             is_remote=False,
             firmware_banner=self._firmware_banner,
             current_values=self._radio_current_values,
+            family=self._local_panel.family(),
+            meta=self._local_panel.meta(),
         )
         self._local_panel.apply_validation(report)
 
@@ -1068,12 +1378,13 @@ class SettingsTab(QWidget):
         self._validation_status.setTextFormat(Qt.TextFormat.RichText)
 
         # Open summary dialog. Hook the "Apply fix" buttons.
-        dialog = ValidationDialog(report, parent=self)
+        dialog = ValidationDialog(report, reg_defs=self._local_panel.reg_defs(), parent=self)
         dialog.apply_fix_requested.connect(self._on_apply_validation_fix)
         dialog.exec()
 
-    def _on_apply_validation_fix(self, sreg: int, value: int) -> None:
-        self._local_panel.set_value(sreg, int(value), is_pin=False)
+    def _on_apply_validation_fix(self, sreg: int, value: object) -> None:
+        value = coerce_value(value)
+        self._local_panel.set_value(sreg, value, is_pin=False)
         # Mark dirty so the user notices. Validation tints stay until next click.
         self._local_panel.mark_dirty(sreg, is_pin=False)
         self._emit_status(f"Staged fix: S{sreg} = {value} (unsaved)", 5000)
@@ -1091,28 +1402,17 @@ class SettingsTab(QWidget):
             QMessageBox.warning(self, "Save preset", "Name cannot be empty.")
             return
 
-        s_regs: dict[int, int] = {}
-        for sreg in sorted(REGISTERS.keys()):
-            reg = REGISTERS[sreg]
-            if reg.read_only:
-                continue
-            v = self._local_panel.get_value(sreg, is_pin=False)
-            if v is not None:
-                s_regs[sreg] = int(v)
-        pin_regs: dict[int, int] = {}
-        for sreg in sorted(PIN_REGISTERS.keys()):
-            v = self._local_panel.get_value(sreg, is_pin=True)
-            if v is not None:
-                pin_regs[sreg] = int(v)
-
+        # Name-keyed from the panel's actual layout, so non-canonical
+        # firmwares (SiK 3.x, MultiComm) round-trip correctly.
         profile = Profile(
             name=name,
             description=dialog.description(),
-            s_registers=s_regs,
-            pin_registers=pin_regs,
+            params=self._local_panel.named_values(),
+            pin_registers=self._local_panel.pin_values(),
             applies_to=dialog.applies_to(),
             category="user",
             notes=dialog.notes(),
+            firmware=self._local_panel.family(),
         )
         try:
             target = save_user_profile(profile)
@@ -1142,19 +1442,12 @@ class SettingsTab(QWidget):
             "board_name": self._board_name,
         }
 
-        # One-shot listener for the next local params_loaded.
-        def _on_loaded(result: object, is_remote: bool) -> None:
-            if is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_loaded)
-            except Exception:
-                pass
-            self._show_export_dialog(result, radio_info)
-
-        self._radio.params_loaded.connect(_on_loaded)
         self._emit_status("Re-reading live config from radio…", 3000)
-        self._radio.read_params(False)
+        self._radio.read_params_once(
+            False,
+            lambda result: self._show_export_dialog(result, radio_info),
+            lambda reason: self._emit_status(f"Export failed: {reason}", 8000),
+        )
 
     def _show_export_dialog(self, ati5: object, radio_info: dict) -> None:
         # Pick a default name based on board + timestamp.
@@ -1249,13 +1542,7 @@ class SettingsTab(QWidget):
             return
 
         # Re-read local via ATI5 to capture firmware names + values
-        def _on_loaded(result, is_remote):
-            if is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_loaded)
-            except Exception:
-                pass
+        def _on_loaded(result):
             self._show_compare_dialog(
                 "Local (this radio)",
                 getattr(result, "s_params", {}) or {},
@@ -1263,10 +1550,13 @@ class SettingsTab(QWidget):
                 f"Profile: {ref.name}",
                 ref.params,
                 {},   # JSON profile doesn't carry sregs — ok, dialog tolerates
+                peer=False,
             )
-        self._radio.params_loaded.connect(_on_loaded)
         self._emit_status("Re-reading live config to compare…", 3000)
-        self._radio.read_params(False)
+        self._radio.read_params_once(
+            False, _on_loaded,
+            lambda reason: self._emit_status(f"Compare failed: {reason}", 8000),
+        )
 
     def _on_compare_with_remote(self) -> None:
         """Diff the local radio's live config against the remote (RTI5)."""
@@ -1280,43 +1570,24 @@ class SettingsTab(QWidget):
         remote_payload = {"params": {}, "names": {}}
 
         # Capture local first
-        def _on_local(result, is_remote):
-            if is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_local)
-            except Exception:
-                pass
+        def _on_local(result):
             local_payload["params"] = getattr(result, "s_params", {}) or {}
             local_payload["names"] = getattr(result, "s_names", {}) or {}
             # Now request remote
-            self._radio.params_loaded.connect(_on_remote)
-            self._radio.error.connect(_on_remote_error)
             self._emit_status("Reading remote settings (RTI5)…", 4000)
-            self._radio.read_params(True)
+            self._radio.read_params_once(True, _on_remote, _on_remote_error)
 
-        def _on_remote(result, is_remote):
-            if not is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_remote)
-                self._radio.error.disconnect(_on_remote_error)
-            except Exception:
-                pass
+        def _on_remote(result):
             remote_payload["params"] = getattr(result, "s_params", {}) or {}
             remote_payload["names"] = getattr(result, "s_names", {}) or {}
             _show()
 
         def _on_remote_error(_msg):
-            try:
-                self._radio.params_loaded.disconnect(_on_remote)
-                self._radio.error.disconnect(_on_remote_error)
-            except Exception:
-                pass
             QMessageBox.warning(
                 self, "Remote unreachable",
-                "RTI5 returned an error — the radios aren't linked yet, "
-                "so the remote's config can't be read. Pair them first, "
+                "The remote radio didn't answer RTI5 — the radios aren't "
+                "linked yet (or, on MultiComm, the selected remote node isn't "
+                "in range), so its config can't be read. Pair them first, "
                 "or use 'Compare with JSON profile' instead.",
             )
 
@@ -1326,24 +1597,29 @@ class SettingsTab(QWidget):
                 local_payload["params"], local_payload["names"],
                 "Remote (live)",
                 remote_payload["params"], remote_payload["names"],
+                peer=True,
             )
 
-        self._radio.params_loaded.connect(_on_local)
         self._emit_status("Reading local settings…", 3000)
-        self._radio.read_params(False)
+        self._radio.read_params_once(
+            False, _on_local,
+            lambda reason: self._emit_status(f"Compare failed: {reason}", 8000),
+        )
 
     def _show_compare_dialog(
         self,
         a_label: str,
-        a_s_params: dict[int, int],
+        a_s_params: dict[int, ParamValue],
         a_s_names: dict[int, str],
         b_label: str,
         b_params_by_name_or_sreg,
         b_s_names: dict[int, str],
+        *,
+        peer: bool = False,
     ) -> None:
         from .compare_dialog import CompareConfigsDialog
         # A side: build name → value and name → sreg from ATI5 result
-        a_params: dict[str, int] = {}
+        a_params: dict[str, ParamValue] = {}
         a_sregs: dict[str, int] = {}
         for sreg, name in a_s_names.items():
             if not name:
@@ -1352,7 +1628,7 @@ class SettingsTab(QWidget):
             if sreg in a_s_params:
                 a_params[name] = a_s_params[sreg]
         # B side: tolerate either {sreg: val} (with names) or {name: val}
-        b_params: dict[str, int] = {}
+        b_params: dict[str, ParamValue] = {}
         b_sregs: dict[str, int] = {}
         if b_s_names:
             # remote ATI5
@@ -1365,11 +1641,13 @@ class SettingsTab(QWidget):
         else:
             # name-keyed (e.g. profile.params)
             for k, v in b_params_by_name_or_sreg.items():
-                b_params[str(k)] = int(v)
+                b_params[str(k)] = coerce_value(v)
             # No B-side sregs available; CompareConfigsDialog renders ok.
         dialog = CompareConfigsDialog(
             a_label, a_params, a_sregs,
             b_label, b_params, b_sregs,
+            family=self._local_panel.family(),
+            peer=peer,
             parent=self,
         )
         dialog.apply_fix_requested.connect(self._on_apply_validation_fix)
@@ -1379,7 +1657,7 @@ class SettingsTab(QWidget):
     def _on_apply_bulk_fixes(self, bundle) -> None:
         """Stage a set of (sreg, value) fixes from the Compare dialog."""
         for sreg, value in bundle:
-            self._on_apply_validation_fix(int(sreg), int(value))
+            self._on_apply_validation_fix(int(sreg), value)
 
     def _on_manage_user_presets(self) -> None:
         # Minimal manage flow: list + delete via QMessageBox confirms.
@@ -1448,26 +1726,12 @@ class SettingsTab(QWidget):
         if not path:
             return
 
-        s_regs: dict[int, int] = {}
-        for sreg in sorted(REGISTERS.keys()):
-            reg = REGISTERS[sreg]
-            if reg.read_only:
-                continue
-            val = self._local_panel.get_value(sreg, is_pin=False)
-            if val is not None:
-                s_regs[sreg] = int(val)
-
-        pin_regs: dict[int, int] = {}
-        for sreg in sorted(PIN_REGISTERS.keys()):
-            val = self._local_panel.get_value(sreg, is_pin=True)
-            if val is not None:
-                pin_regs[sreg] = int(val)
-
         profile = Profile(
             name=name.strip(),
             description="",
-            s_registers=s_regs,
-            pin_registers=pin_regs,
+            params=self._local_panel.named_values(),
+            pin_registers=self._local_panel.pin_values(),
+            firmware=self._local_panel.family(),
         )
         try:
             save_profile(path, profile)
@@ -1479,21 +1743,38 @@ class SettingsTab(QWidget):
 
     # ---------------------------------------------------------------- radio signals
     def _on_params_loaded(self, result: object, is_remote: bool) -> None:
-        s_params: dict[int, int] = getattr(result, "s_params", {}) or {}
+        s_params: dict[int, ParamValue] = getattr(result, "s_params", {}) or {}
         pin_params: dict[int, int] = getattr(result, "pin_params", {}) or {}
         # New in v3 of Ati5Result: the firmware's reported parameter names
         # so the panel can render correct labels per radio variant.
         s_names: dict[int, str] = getattr(result, "s_names", {}) or {}
         pin_names: dict[int, str] = getattr(result, "pin_names", {}) or {}
+        family = str(getattr(result, "family", "") or FAMILY_SIK)
+        meta = getattr(result, "s_meta", None)
+        if not is_remote:
+            self._set_family(family)
 
+        # Only an explicit Load Settings overwrites unsaved edits; re-reads
+        # done for Compare / Export / verify / connect keep them.
+        explicit = (
+            self._load_phase == ("remote" if is_remote else "local")
+            or is_remote in self._overwrite_next
+        )
+        self._overwrite_next.discard(is_remote)
         panel = self._remote_panel if is_remote else self._local_panel
+        if is_remote:
+            self._remote_panel.setEnabled(True)
         panel.apply_values(
             s_params,
             pin_params,
             s_names=s_names if s_names else None,
             pin_names=pin_names if pin_names else None,
+            family=family,
+            meta=meta if meta else None,
+            keep_dirty=not explicit,
         )
-        panel.mark_all_clean()
+        if explicit:
+            panel.mark_all_clean()
 
         # Cache the LOCAL snapshot so the validator's R19 (firmware lockdown
         # detection) can compare user-intended values against what the radio
@@ -1503,6 +1784,8 @@ class SettingsTab(QWidget):
             self._radio_current_values = dict(s_params)
 
         side = "remote" if is_remote else "local"
+        if is_remote and family == FAMILY_MULTICOMM and self._radio.remote_node is not None:
+            side = f"remote NODEID {self._radio.remote_node}"
         self._emit_status(f"Loaded {side} settings ({len(s_params)} registers)", 5000)
 
         # Sequenced load: kick off the remote phase only after local succeeded
@@ -1514,7 +1797,15 @@ class SettingsTab(QWidget):
         elif self._load_phase == "remote" and is_remote:
             self._load_phase = None
 
-    def _on_write_result(self, sreg: int, value: int, ok: bool, is_remote: bool) -> None:
+    def _on_params_failed(self, is_remote: bool, reason: str) -> None:
+        self._overwrite_next.discard(is_remote)
+        if self._load_phase == "remote" and is_remote:
+            self._emit_status(f"Remote settings not loaded: {reason}", 6000)
+            self._load_phase = None
+        elif self._load_phase == "local" and not is_remote:
+            self._load_phase = None
+
+    def _on_write_result(self, sreg: int, value: object, ok: bool, is_remote: bool) -> None:
         # Match against either pin or s-register pending entry.
         keys = [
             (sreg, is_remote, False),
@@ -1529,6 +1820,10 @@ class SettingsTab(QWidget):
                 matched = True
                 break
 
+        if not matched:
+            # Someone else's write (pairing wizard, Apply & Persist): not
+            # ours to account for, and the panel row may hold other edits.
+            return
         panel = self._remote_panel if is_remote else self._local_panel
         prefix = "R" if is_pin else "S"
         if ok:
@@ -1539,7 +1834,11 @@ class SettingsTab(QWidget):
 
         if matched and not self._save_pending:
             if self._save_failures == 0:
-                self._emit_status("All changes saved.", 5000)
+                self._emit_status(
+                    "All changes saved — reboot the radio(s) to apply them."
+                    if self._family == FAMILY_MULTICOMM else "All changes saved.",
+                    6000,
+                )
             else:
                 self._announce_save_failures()
             self._save_failures = 0

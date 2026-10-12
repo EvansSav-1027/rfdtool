@@ -124,13 +124,18 @@ def get_sync(ser: _SerialLike, *, timeout: float = 1.0, retries: int = 5) -> Non
 
 
 def get_device(ser: _SerialLike, *, timeout: float = 1.0) -> tuple[int, int]:
-    """Return ``(board_id, freq_id)`` from the bootloader's ``GET_DEVICE`` reply."""
+    """Return ``(board_id, freq_id)`` from the bootloader's ``GET_DEVICE`` reply.
+
+    The SiK bootloader sends the two payload bytes *first*, then
+    ``INSYNC, OK`` (ArduPilot SiK ``Firmware/tools/uploader.py``:
+    ``identify()`` does ``__recv(); __recv(); __getSync()``).
+    """
     ser.write(bytes([GET_DEVICE, EOC]))
-    a = _read_byte(ser, timeout)
-    if a != INSYNC:
-        raise UploadError(f"expected INSYNC (0x12), got 0x{a:02X}")
     board_id = _read_byte(ser, timeout)
     freq_id = _read_byte(ser, timeout)
+    a = _read_byte(ser, timeout)
+    if a != INSYNC:
+        raise UploadError(f"expected INSYNC (0x12) after GET_DEVICE payload, got 0x{a:02X}")
     tail = _read_byte(ser, timeout)
     if tail == FAILED:
         raise UploadError("bootloader returned FAILED to GET_DEVICE")
@@ -209,6 +214,14 @@ def upload_8051(
     operations (no REBOOT is sent in that case).
     """
     total = image.total_bytes()
+    # Refuse images this uploader can't address BEFORE anything is erased —
+    # banked (>64 KiB) images need the 3-byte LOAD_ADDRESS form.
+    for addr, data in image.chunks:
+        if addr < 0 or addr + len(data) - 1 > 0xFFFF:
+            raise UploadError(
+                f"image has data at 0x{addr:X}, beyond 16-bit addressing "
+                "(banked firmware is not supported) — nothing was erased"
+            )
 
     _check_cancel(cancel_check)
     get_sync(ser, retries=sync_retries)

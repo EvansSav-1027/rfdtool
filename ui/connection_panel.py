@@ -30,8 +30,12 @@ from rfd.radio import Radio
 from .theme import STATUS_LED_QSS
 
 
-# Standard SiK baud rates.  57600 is the factory default for RFD900x.
-_BAUDS: tuple[int, ...] = (2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400)
+# Standard SiK baud rates plus MultiComm's higher S1BAUD options.  57600 is
+# the factory default for both RFD900x and MultiComm.
+_BAUDS: tuple[int, ...] = (
+    2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400,
+    460800, 1000000, 1200000, 1500000,
+)
 _DEFAULT_BAUD = 57600
 
 
@@ -226,6 +230,8 @@ class ConnectionPanel(QWidget):
         board_name = ""
         if isinstance(info, dict):
             board_name = str(info.get("board_name") or "")
+            if info.get("firmware_family") == "multicomm":
+                board_name = f"{board_name} · MultiComm" if board_name else "MultiComm"
         self._board_name = board_name
         if self._port and self._baud:
             if board_name:

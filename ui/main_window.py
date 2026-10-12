@@ -105,10 +105,14 @@ class MainWindow(QMainWindow):
         # tab's existing fix-staging plumbing.
         wizard.apply_fix_requested.connect(st._on_apply_validation_fix)
         wizard.exec()
+        # Parented to the main window, so without this every closed wizard
+        # (and its radio signal connections) would live until exit.
+        wizard.deleteLater()
 
     def _show_pairing_guide(self) -> None:
         from .pairing_guide import PairingGuideDialog
         guide = PairingGuideDialog(parent=self)
+        guide.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         guide.open_wizard_requested.connect(self._show_pairing_wizard)
         guide.show()
 
@@ -117,7 +121,8 @@ class MainWindow(QMainWindow):
             self,
             "About rfdtool",
             "<b>rfdtool</b><br>"
-            "Linux GUI for configuring RFD900-series SiK radio modems."
+            "Linux GUI for configuring RFD900-series radio modems running "
+            "SiK or RFD MultiComm (v4.x) firmware."
             "<br><br>"
             "Developer: <b>Skoll</b><br>"
             'Website: <a href="https://skoll.dev">skoll.dev</a><br>'

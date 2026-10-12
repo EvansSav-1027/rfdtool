@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """rfdtool entry point.
 
-Run this directly:  python rfdtool.py
-Or with a starting port:  python rfdtool.py --port /dev/ttyUSB0 --baud 57600
+GUI:            python rfdtool.py [--port /dev/ttyUSB0 --baud 57600]
+Flash .gbl:     python rfdtool.py --port /dev/ttyUSB0 --file firmware.gbl [--yes]
+Detect only:    python rfdtool.py --port /dev/ttyUSB0 --dry-run
+
+``--file``, ``--dry-run`` or ``--batch`` select the command-line flasher
+(:mod:`rfd.gbl_flash`), which needs only pyserial + xmodem — Qt is never
+imported on that path, so it runs on headless machines.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 
-from PySide6.QtWidgets import QApplication
+_FLASH_FLAGS = ("--file", "--dry-run", "--batch")
 
-from rfd.radio import Radio
-from ui.main_window import MainWindow, run_startup_checks
-from ui.theme import apply_light_theme
+
+def _wants_flasher(argv: list[str]) -> bool:
+    return any(a == f or a.startswith(f + "=") for a in argv for f in _FLASH_FLAGS)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="rfdtool",
-        description="Linux GUI for configuring RFD900-series SiK radio modems.",
+        description="Linux GUI for configuring RFD900-series radio modems. "
+                    "Add --file FIRMWARE.gbl (or --dry-run) to flash x-series "
+                    "radios from the command line instead.",
     )
     p.add_argument(
         "--port",
@@ -46,7 +53,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if _wants_flasher(raw):
+        from rfd.gbl_flash import main as flash_main
+        return flash_main(raw)
+
     args = parse_args(argv)
+
+    from PySide6.QtWidgets import QApplication
+
+    from rfd.radio import Radio
+    from ui.main_window import MainWindow, run_startup_checks
+    from ui.theme import apply_light_theme
 
     app = QApplication(sys.argv)
     app.setApplicationName("rfdtool")

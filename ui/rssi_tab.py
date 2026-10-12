@@ -6,7 +6,12 @@ Plots local/remote RSSI and noise floor over a rolling 60-second window using
 * **MAVLink RADIO_STATUS** — passive; samples arrive whenever the radio
   injects a packet into the data stream.
 * **ATI7 polling** — active; a :class:`QTimer` periodically calls
-  :meth:`Radio.poll_rssi`, which briefly takes the radio into command mode.
+  :meth:`Radio.poll_rssi`.  While this source is selected, unpaused and the
+  tab is visible, the radio is held in command mode (an RSSI *session*), so
+  each poll is a bare ATI7 and the chosen interval is honoured — entering
+  command mode per poll costs ≥2.2 s of +++ guard time.  Serial passthrough
+  is paused meanwhile.  On MultiComm the session switches the ``AT&T=RSSI``
+  report on (ATI7 is TDM timing there) and values are plotted in dBm.
 
 A pause toggle freezes the chart without dropping data, and a clear button
 empties the rolling history.  The chart and controls are disabled while the
@@ -67,6 +72,13 @@ class RssiTab(QWidget):
         self._source = self.SOURCE_MAVLINK
         self._radio_state = Radio.STATE_DISCONNECTED
         self._latest_mavlink: Optional[object] = None  # last RadioStatus
+        self._latest_report: Optional[object] = None   # last RssiReport
+        self._units = "raw"
+        # Future of the in-flight poll; a MultiComm poll takes >2 s, so
+        # never queue another until it finishes.
+        self._poll_future = None
+        self._session_on = False     # we asked the radio to hold command mode
+        self._visible = False
 
         # ---- source / control row ---------------------------------------
         self._mav_radio = QRadioButton("MAVLink RADIO_STATUS", self)
@@ -103,6 +115,15 @@ class RssiTab(QWidget):
         controls.addWidget(self._pause_btn)
         controls.addWidget(self._clear_btn)
 
+        self._session_note = QLabel(
+            "Polling holds the radio in command mode: serial passthrough "
+            "(telemetry) is paused until you Pause, switch to MAVLink, or "
+            "leave this tab.", self,
+        )
+        self._session_note.setWordWrap(True)
+        self._session_note.setStyleSheet("color: #d68910;")
+        self._session_note.setVisible(False)
+
         # ---- plot --------------------------------------------------------
         pg.setConfigOptions(antialias=True)
         self._plot = pg.PlotWidget(self)
@@ -138,6 +159,7 @@ class RssiTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.addLayout(controls)
+        outer.addWidget(self._session_note)
         outer.addWidget(self._plot, 1)
         outer.addWidget(self._status_label)
 
@@ -157,6 +179,7 @@ class RssiTab(QWidget):
         radio.mavlink_radio_status.connect(self._on_mavlink_status)
         radio.rssi_received.connect(self._on_rssi_received)
         radio.state_changed.connect(self._on_state_changed)
+        radio.radio_info.connect(self._on_radio_info)
 
         # Default-disabled until the radio reports a usable state.
         self._set_controls_enabled(False)
@@ -178,6 +201,7 @@ class RssiTab(QWidget):
         self._interval_spin.setEnabled(
             self._source == self.SOURCE_ATI7 and self._is_radio_usable()
         )
+        self._sync_session()
         self._restart_polling()
 
     def _on_interval_changed(self, _value: float) -> None:
@@ -188,6 +212,8 @@ class RssiTab(QWidget):
     def _on_pause_toggled(self, paused: bool) -> None:
         self._paused = paused
         self._pause_btn.setText("Resume" if paused else "Pause")
+        self._sync_session()
+        self._restart_polling()
 
     def _clear_history(self) -> None:
         self._samples.clear()
@@ -195,10 +221,31 @@ class RssiTab(QWidget):
         self._refresh_status()
 
     # ---------------------------------------------------------- radio events
+    def _on_radio_info(self, info: object) -> None:
+        family = info.get("firmware_family") if isinstance(info, dict) else None
+        self._ati7_radio.setText(
+            "AT&T=RSSI polling" if family == "multicomm" else "ATI7 polling"
+        )
+
+    def _set_units(self, units: str) -> None:
+        if units == self._units:
+            return
+        self._units = units
+        self._clear_history()
+        if units == "dBm":
+            self._plot.setLabel("left", "dBm")
+            self._plot.setYRange(-130, -20, padding=0)
+        else:
+            self._plot.setLabel("left", "dB")
+            self._plot.setYRange(0, 255, padding=0)
+
     def _on_state_changed(self, state: str) -> None:
         self._radio_state = state
+        if state == Radio.STATE_DISCONNECTED:
+            self._session_on = False    # the radio dropped all holds
         usable = self._is_radio_usable()
         self._set_controls_enabled(usable)
+        self._sync_session()
         if not usable:
             self._poll_timer.stop()
         else:
@@ -207,6 +254,7 @@ class RssiTab(QWidget):
     def _on_mavlink_status(self, msg: object) -> None:
         if self._source != self.SOURCE_MAVLINK or self._paused:
             return
+        self._set_units("raw")
         rssi = float(getattr(msg, "rssi", 0) or 0)
         remrssi = float(getattr(msg, "remrssi", 0) or 0)
         noise = float(getattr(msg, "noise", 0) or 0)
@@ -217,33 +265,69 @@ class RssiTab(QWidget):
     def _on_rssi_received(self, report: object) -> None:
         if self._source != self.SOURCE_ATI7 or self._paused:
             return
-        l_rssi = float(getattr(report, "local_rssi", None) or 0)
-        r_rssi = float(getattr(report, "remote_rssi", None) or 0)
-        l_noise = float(getattr(report, "local_noise", None) or 0)
-        r_noise = float(getattr(report, "remote_noise", None) or 0)
-        self._append_sample(time.monotonic(), l_rssi, r_rssi, l_noise, r_noise)
+        units = str(getattr(report, "units", "raw") or "raw")
+        self._set_units(units)
+        self._latest_report = report
+        # Missing values plot as gaps (NaN) in dBm mode; 0 is a real reading
+        # in SiK's raw units so keep the old behaviour there.
+        missing = float("nan") if units == "dBm" else 0.0
+
+        def val(name: str) -> float:
+            v = getattr(report, name, None)
+            return missing if v is None else float(v)
+
+        self._append_sample(
+            time.monotonic(),
+            val("local_rssi"), val("remote_rssi"),
+            val("local_noise"), val("remote_noise"),
+        )
+
+    # ---------------------------------------------------------- visibility
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().showEvent(event)
+        self._visible = True
+        self._sync_session()
+        self._restart_polling()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().hideEvent(event)
+        self._visible = False
+        self._sync_session()
+        self._poll_timer.stop()
 
     # ---------------------------------------------------------- polling
+    def _wants_polling(self) -> bool:
+        return (
+            self._source == self.SOURCE_ATI7
+            and not self._paused
+            and self._visible
+            and self._is_radio_usable()
+        )
+
+    def _sync_session(self) -> None:
+        """Open/close the radio's command-mode hold to match _wants_polling."""
+        want = self._wants_polling()
+        if want and not self._session_on:
+            self._session_on = True
+            self._radio.start_rssi_session()
+        elif not want and self._session_on:
+            self._session_on = False
+            self._radio.stop_rssi_session()
+        self._session_note.setVisible(self._session_on)
     def _on_poll_tick(self) -> None:
-        if (
-            self._source != self.SOURCE_ATI7
-            or self._paused
-            or not self._is_radio_usable()
-        ):
+        if not self._wants_polling():
+            return
+        if self._poll_future is not None and not self._poll_future.done():
             return
         try:
-            self._radio.poll_rssi()
+            self._poll_future = self._radio.poll_rssi()
         except Exception:
             # Errors are surfaced via Radio.error; nothing to do here.
             pass
 
     def _restart_polling(self) -> None:
         self._poll_timer.stop()
-        if (
-            self._source == self.SOURCE_ATI7
-            and not self._paused
-            and self._is_radio_usable()
-        ):
+        if self._wants_polling():
             interval_ms = max(50, int(self._interval_spin.value() * 1000))
             self._poll_timer.start(interval_ms)
 
@@ -302,10 +386,26 @@ class RssiTab(QWidget):
             self._status_label.setText("No samples yet.")
             return
         _, l_rssi, r_rssi, l_noise, r_noise = self._samples[-1]
+
+        def fmt(v: float) -> str:
+            return "—" if v != v else f"{v:.0f}"   # NaN → dash
+
+        unit = " dBm" if self._units == "dBm" else ""
         head = (
-            f"Most recent: L={int(l_rssi)} R={int(r_rssi)}  "
-            f"noise L={int(l_noise)} R={int(r_noise)}"
+            f"Most recent{unit}: L={fmt(l_rssi)} R={fmt(r_rssi)}  "
+            f"noise L={fmt(l_noise)} R={fmt(r_noise)}"
         )
+        report = self._latest_report
+        if self._source == self.SOURCE_ATI7 and self._units == "dBm" and report is not None:
+            linked = getattr(report, "linked", None)
+            nodes = getattr(report, "nodes", ()) or ()
+            parts = [f"node {n.node}: {fmt(n.local_rssi if n.local_rssi is not None else float('nan'))}"
+                     for n in nodes]
+            state = {True: "linked", False: "NO LINK", None: "link unknown"}[linked]
+            self._status_label.setText(
+                head + f"\n{state}" + (f" · heard {', '.join(parts)}" if parts else "")
+            )
+            return
         if self._source == self.SOURCE_MAVLINK and self._latest_mavlink is not None:
             rxerr = getattr(self._latest_mavlink, "rxerrors", None)
             fixed = getattr(self._latest_mavlink, "fixed", None)

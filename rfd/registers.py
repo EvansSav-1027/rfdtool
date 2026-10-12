@@ -29,6 +29,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+# Firmware families rfdtool knows how to drive.  SiK covers canonical
+# ArduPilot SiK plus RFDesign's SiK 2.x/3.x; MultiComm is RFDesign's
+# mesh/multipoint firmware for V2 (x2/ux2) hardware, which uses an entirely
+# different S-register map (see :mod:`rfd.multicomm`).
+FAMILY_SIK = "sik"
+FAMILY_MULTICOMM = "multicomm"
+
+# A parameter value: scalar int for most registers, tuple of ints for the
+# comma-separated array registers MultiComm exposes (ENCRYPTKEY, RCDEFS…).
+ParamValue = int | tuple[int, ...]
+
+
 @dataclass(frozen=True)
 class ParamSpec:
     """A single parameter's semantic specification — no sreg number.
@@ -40,14 +52,19 @@ class ParamSpec:
     name: str
     label: str
     tooltip: str
-    kind: str                       # "int" | "enum" | "bool"
-    minimum: int | None
-    maximum: int | None
+    kind: str                       # "int" | "enum" | "bool" | "bitmask" | "list"
+    minimum: int | None             # for "list": per-element minimum
+    maximum: int | None             # for "list": per-element maximum
     enum: dict[int, str] | None
-    default: int | None
+    default: ParamValue | None
     units: str | None
     variant_notes: str = ""
     read_only: bool = False
+    length: int | None = None       # "list" only: number of elements
+    group: str = ""                 # UI section heading ("" = ungrouped)
+    # "network" = must match on every node; "node" = per-node (often must
+    # differ, e.g. NODEID); "" = unclassified.
+    scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,10 +83,119 @@ class RegisterDef:
     minimum: int | None
     maximum: int | None
     enum: dict[int, str] | None
-    default: int | None
+    default: ParamValue | None
     units: str | None
     variant_notes: str = ""
     read_only: bool = False
+    length: int | None = None
+    group: str = ""
+    scope: str = ""
+
+
+@dataclass(frozen=True)
+class ParamMeta:
+    """Constraints a MultiComm radio reports for one register.
+
+    Parsed from the decorated form ``S1:BITRATE(N)[56..200]=200 {12,56,…,}``
+    (``ATI10:n``, and ATI5 if a build prints it).  These are per-radio —
+    an 868 MHz unit reports FREQMIN 865000..870000 and NUMCHANS 1..8 — so
+    they override the manual's static catalog whenever available.
+
+    ``type_code``: N numeric, B boolean, L list-of-labels, M 64-bit mask,
+    A array.  ``mask`` (L only) is a bitfield of allowed values, 0 = any.
+    ``length`` (A only) is the element count.
+    """
+    type_code: str = ""
+    minimum: int | None = None
+    maximum: int | None = None
+    mask: int | None = None
+    length: int | None = None
+    options: tuple[str, ...] = ()
+
+    def allowed_values(self) -> dict[int, str] | None:
+        """value → label for enumerable params, honouring range and mask."""
+        if not self.options:
+            return None
+        lo = self.minimum if self.minimum is not None else 0
+        hi = self.maximum
+        numeric = all(o.lstrip("-").isdigit() for o in self.options)
+        out: dict[int, str] = {}
+        if numeric and self.type_code == "N":
+            # Option list is the value set itself (BITRATE, S1BAUD).
+            for o in self.options:
+                v = int(o)
+                if v >= lo and (hi is None or v <= hi):
+                    out[v] = o
+            return out
+        # Labels: index = value, except when there is exactly one label per
+        # value in a range not starting at 0 (PRI 1..3 = Low/Med/High).
+        offset = lo if hi is not None and len(self.options) == hi - lo + 1 else 0
+        for i, label in enumerate(self.options):
+            v = i + offset
+            if v < lo or (hi is not None and v > hi):
+                continue
+            if self.mask and not self.mask >> v & 1:
+                continue
+            out[v] = label
+        return out
+
+
+def apply_meta(spec: "ParamSpec", meta: ParamMeta | None) -> "ParamSpec":
+    """Overlay radio-reported constraints on a catalog spec.
+
+    Keeps the catalog's label/tooltip/group/scope (and friendlier enum
+    labels where the value is still allowed); takes kind, range, allowed
+    values and array length from the radio.
+    """
+    if meta is None:
+        return spec
+    from dataclasses import replace
+
+    kind, enum = spec.kind, spec.enum
+    lo = meta.minimum if meta.minimum is not None else spec.minimum
+    hi = meta.maximum if meta.maximum is not None else spec.maximum
+    allowed = meta.allowed_values()
+    if meta.type_code == "A":
+        kind = "list"
+    elif meta.type_code == "M":
+        kind = "bitmask"
+    elif allowed:
+        kind = "bool" if meta.type_code == "B" and set(allowed) <= {0, 1} else "enum"
+        nice = spec.enum or {}
+        enum = {v: nice.get(v, label) for v, label in sorted(allowed.items())}
+    elif meta.type_code == "N" and spec.kind not in ("int", "bitmask"):
+        kind, enum = "int", None
+    return replace(
+        spec, kind=kind, minimum=lo, maximum=hi, enum=enum,
+        length=meta.length if meta.length is not None else spec.length,
+    )
+
+
+# --------------------------------------------------------------------- values
+def coerce_value(value: object) -> ParamValue:
+    """Normalise a parameter value from any source (ATI5 text, JSON, editor)
+    to :data:`ParamValue`.
+
+    Lists/tuples and comma-separated strings (``"1,1,0,"`` — MultiComm's
+    array syntax, trailing comma optional) become tuples of ints; anything
+    else goes through ``int()``.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(int(v) for v in value)
+    if isinstance(value, str):
+        text = value.strip()
+        if "," in text:
+            return tuple(int(p) for p in text.split(",") if p.strip())
+        return int(text)
+    return int(value)  # type: ignore[arg-type]
+
+
+def format_value(value: ParamValue) -> str:
+    """Render a value in AT-command syntax.  Arrays get MultiComm's trailing
+    comma (``ATS49=0,64,2,64,``), matching the firmware's own ATI5 output."""
+    if isinstance(value, tuple):
+        return "".join(f"{v}," for v in value)
+    return str(int(value))
 
 
 # --------------------------------------------------------------------- enums
@@ -156,8 +282,8 @@ CATALOG: dict[str, ParamSpec] = {
                 "cost of current draw and regulatory headroom.",
         kind="int", minimum=0, maximum=30, enum=None,
         default=20, units="dBm",
-        variant_notes="RFD900x/ux/x2 can hit 30 dBm (1 W); RFD900+ caps at 27; "
-                      "RFD900/a/u cap at 20.",
+        variant_notes="Every variant (RFD900/a/u/+, RFD900x/ux/x2) is rated up "
+                      "to 30 dBm (1 W); regional EIRP limits usually apply first.",
     ),
     "ECC": ParamSpec(
         name="ECC",
@@ -446,14 +572,31 @@ def get_spec(name: str) -> ParamSpec | None:
     return CATALOG.get(name)
 
 
-def derive_def(sreg: int, name: str | None = None) -> RegisterDef:
+def derive_def(
+    sreg: int,
+    name: str | None = None,
+    *,
+    family: str = FAMILY_SIK,
+    meta: ParamMeta | None = None,
+) -> RegisterDef:
     """Build a :class:`RegisterDef` for the given sreg and parameter name.
+
+    ``family`` selects the catalog: MultiComm registers are looked up in
+    :mod:`rfd.multicomm` (by sreg, cross-checked against the name) because
+    several MultiComm names collide with SiK names that mean something
+    else (e.g. ``TXPOWER`` defaults, ``RATE/FREQBAND`` range).
 
     If `name` is None or absent from the catalog, a generic int-spec is
     used so the UI still renders a row instead of a placeholder.
     """
-    spec = (CATALOG.get(name) if name else None) or _GENERIC_PARAM
-    if spec is _GENERIC_PARAM:
+    if family == FAMILY_MULTICOMM:
+        from . import multicomm
+        spec = multicomm.spec_for(sreg, name) or _GENERIC_PARAM
+    else:
+        spec = (CATALOG.get(name) if name else None) or _GENERIC_PARAM
+    generic = spec is _GENERIC_PARAM
+    spec = apply_meta(spec, meta)
+    if generic:
         # Unknown name — synthesise a label that still identifies the row,
         # using sreg + name (if reported by firmware) so users can
         # correlate with manuals / forums.
@@ -476,7 +619,21 @@ def derive_def(sreg: int, name: str | None = None) -> RegisterDef:
         units=spec.units,
         variant_notes=spec.variant_notes,
         read_only=spec.read_only,
+        length=spec.length,
+        group=spec.group,
+        scope=spec.scope,
     )
+
+
+def validate_def(reg: RegisterDef | ParamSpec, value: ParamValue) -> tuple[bool, str]:
+    """Validate `value` against a concrete row definition.
+
+    Prefer this over the sreg-keyed :func:`validate` whenever the caller
+    already holds the row's :class:`RegisterDef` — it's correct for every
+    firmware layout, whereas :func:`validate` assumes canonical SiK sregs.
+    """
+    label = f"S{reg.sreg} {reg.name}" if isinstance(reg, RegisterDef) else reg.name
+    return _validate_against_spec(reg, value, sreg_label=label)  # type: ignore[arg-type]
 
 
 def validate_value(name: str, value: int) -> tuple[bool, str]:
@@ -488,11 +645,30 @@ def validate_value(name: str, value: int) -> tuple[bool, str]:
 
 
 def _validate_against_spec(
-    spec: ParamSpec, value: int, *, sreg_label: str = "",
+    spec: ParamSpec, value: ParamValue, *, sreg_label: str = "",
 ) -> tuple[bool, str]:
     if spec.read_only:
         return False, f"{sreg_label or spec.name} is read-only"
-    if spec.kind == "int":
+    if spec.kind == "list":
+        if not isinstance(value, tuple):
+            return False, f"{sreg_label or spec.name}: expected a comma-separated list"
+        if spec.length is not None and len(value) > spec.length:
+            return False, (
+                f"{sreg_label or spec.name}: {len(value)} entries "
+                f"(maximum {spec.length})"
+            )
+        for v in value:
+            if (spec.minimum is not None and v < spec.minimum) or (
+                spec.maximum is not None and v > spec.maximum
+            ):
+                return False, (
+                    f"{sreg_label or spec.name}: element {v} out of range "
+                    f"({spec.minimum}..{spec.maximum})"
+                )
+        return True, ""
+    if isinstance(value, tuple):
+        return False, f"{sreg_label or spec.name}: expected a single number, not a list"
+    if spec.kind in ("int", "bitmask"):
         if spec.minimum is not None and value < spec.minimum:
             return False, (
                 f"{sreg_label or spec.name}: {value} out of range "

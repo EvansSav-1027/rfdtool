@@ -75,6 +75,10 @@ class _WelcomeStage(_Stage):
             "<p>I'll walk you through configuring two radios with identical "
             "settings, saving them to EEPROM, rebooting both, and verifying "
             "they linked. Takes ~2 minutes per radio.</p>"
+            "<p><b>MultiComm radios:</b> the default automatic-master mode "
+            "pairs with identical settings. For fixed-master mode use the "
+            "'fixed master: master' preset on radio A and 'fixed master: "
+            "node' on radio B — they must have different NODEID/SLOTIDS.</p>"
             "<p>How are your radios connected?</p>"
         )
         intro.setTextFormat(Qt.TextFormat.RichText)
@@ -136,7 +140,7 @@ class _ConfigureStage(_Stage):
         # Built-in presets that look most useful for "first time" users:
         # one factory baseline per family + the Maximize combos.
         for preset in BUILT_IN_PRESETS:
-            if preset.category in ("model", "maximize"):
+            if preset.category in ("model", "maximize", "multicomm"):
                 self._source_combo.addItem(f"Preset · {preset.name}", preset)
         self._source_combo.insertSeparator(self._source_combo.count())
         self._source_combo.addItem("Load profile from JSON file…", "_load")
@@ -276,6 +280,8 @@ class _ConfigureStage(_Stage):
             title=f"{self._title} — apply",
             parent=self,
         )
+        # "Stage radio's value" buttons on rejected registers.
+        dlg.apply_fix_requested.connect(wizard.stage_fix)
         dlg.exec()
         if dlg.report is None:
             self._status.setText(
@@ -387,13 +393,7 @@ class _SaveProfileStage(_Stage):
         if wizard is None:
             return
 
-        def _on_loaded(result: object, is_remote: bool) -> None:
-            if is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_loaded)
-            except Exception:
-                pass
+        def _on_loaded(result: object) -> None:
             radio_info = {
                 "banner": wizard.firmware_banner(),
                 "board_name": wizard.board_name(),
@@ -416,9 +416,14 @@ class _SaveProfileStage(_Stage):
             self.saved.emit(self._profile, str(self._saved_path))
             self.complete.emit()
 
-        self._radio.params_loaded.connect(_on_loaded)
+        def _on_failed(reason: str) -> None:
+            self._status.setText(
+                f"<span style='color:{_ERR_RED};'>Could not read the radio: "
+                f"{reason}</span>"
+            )
+
         self._status.setText("Re-reading radio config…")
-        self._radio.read_params(False)
+        self._radio.read_params_once(False, _on_loaded, _on_failed)
 
     def _on_save_copy(self) -> None:
         if self._profile is None:
@@ -583,6 +588,8 @@ class _VerifyLinkStage(_Stage):
         self._reference_profile: Profile | None = None
         self._link_up = False
         self._start_t = 0.0
+        self._poll_future = None
+        self._active = False
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("<h3>Verify the link</h3>"))
@@ -618,7 +625,13 @@ class _VerifyLinkStage(_Stage):
         self._radio.rssi_received.connect(self._on_rssi)
         self._radio.mavlink_radio_status.connect(self._on_mavlink)
 
+    def deactivate(self) -> None:
+        """Stop polling and ignore link reports (stage left or wizard closed)."""
+        self._active = False
+        self._poll.stop()
+
     def reset(self) -> None:
+        self._active = True
         self._link_up = False
         self._start_t = time.monotonic()
         self._status_lbl.setText("Waiting for first poll…")
@@ -634,6 +647,8 @@ class _VerifyLinkStage(_Stage):
         self._reference_profile = profile
 
     def _tick(self) -> None:
+        if not self._active:
+            return
         elapsed = time.monotonic() - self._start_t
         self._progress.setValue(int(min(elapsed, self.PASS_TIMEOUT_S)))
         if elapsed >= self.PASS_TIMEOUT_S:
@@ -646,20 +661,32 @@ class _VerifyLinkStage(_Stage):
             )
             self._compare_btn.setEnabled(True)
             return
-        # Trigger a fresh ATI7 read on this poll cycle.
-        self._radio.poll_rssi()
+        # Trigger a fresh ATI7 (MultiComm: AT&T=RSSI / RTI) read, unless the
+        # previous one is still running — MultiComm polls take >2 s.
+        if self._poll_future is not None and not self._poll_future.done():
+            return
+        self._poll_future = self._radio.poll_rssi()
 
     def _on_rssi(self, report) -> None:
+        # Reports also arrive from the RSSI tab and while other stages are
+        # showing; only react while this stage is live and still waiting.
+        if not self._active or self._link_up:
+            return
         local = getattr(report, "local_rssi", None)
         remote = getattr(report, "remote_rssi", None)
         pkts = getattr(report, "pkts", None)
         rxe = getattr(report, "rxe", None)
+        unit = " dBm" if getattr(report, "units", "raw") == "dBm" else ""
         text = (
-            f"L/R RSSI: <b>{local}</b>/<b>{remote}</b>"
+            f"L/R RSSI{unit}: <b>{local if local is not None else '—'}</b>/"
+            f"<b>{remote if remote is not None else '—'}</b>"
             + (f"  pkts: <b>{pkts}</b>" if pkts is not None else "")
             + (f"  rxerr: {rxe}" if rxe is not None else "")
         )
-        if pkts and pkts > 0 and remote and remote > 0:
+        linked = getattr(report, "linked", None)
+        if linked is None:
+            linked = bool(pkts and pkts > 0 and remote and remote > 0)
+        if linked:
             self._link_up = True
             self._poll.stop()
             self._status_lbl.setText(
@@ -673,6 +700,8 @@ class _VerifyLinkStage(_Stage):
     def _on_mavlink(self, msg) -> None:
         # MAVLink RADIO_STATUS gives us another path to "linked" detection
         # when the user has MAVLink framing on.
+        if not self._active or self._link_up:
+            return
         rssi = getattr(msg, "rssi", 0)
         remrssi = getattr(msg, "remrssi", 0)
         if rssi and remrssi:
@@ -696,13 +725,7 @@ class _VerifyLinkStage(_Stage):
             )
             return
         # Snapshot local panel via fresh ATI5; once loaded, build diff.
-        def _on_loaded(result, is_remote):
-            if is_remote:
-                return
-            try:
-                self._radio.params_loaded.disconnect(_on_loaded)
-            except Exception:
-                pass
+        def _on_loaded(result):
             local_params = {}
             local_sregs = {}
             for sreg, name in (getattr(result, "s_names", {}) or {}).items():
@@ -714,18 +737,24 @@ class _VerifyLinkStage(_Stage):
                 "Local (this radio)", local_params, local_sregs,
                 "Reference profile", dict(self._reference_profile.params), ref_sregs,
                 title="Pairing diagnostic",
+                family=getattr(result, "family", None),
+                # The reference came from radio A; this is radio B.
+                peer=True,
                 parent=self,
             )
             dlg.apply_fix_requested.connect(wizard.stage_fix)
             dlg.exec()
-        self._radio.params_loaded.connect(_on_loaded)
-        self._radio.read_params(False)
+
+        def _on_failed(reason: str) -> None:
+            QMessageBox.warning(self, "Compare", f"Could not read the radio: {reason}")
+
+        self._radio.read_params_once(False, _on_loaded, _on_failed)
 
 
 class PairingWizard(QDialog):
     """The 5-stage modal pairing wizard."""
 
-    apply_fix_requested = Signal(int, int)
+    apply_fix_requested = Signal(int, object)   # sreg, value (may be a tuple)
 
     def __init__(
         self,
@@ -796,12 +825,15 @@ class PairingWizard(QDialog):
     def board_name(self) -> str:
         return self._board_name()
 
-    def stage_fix(self, sreg: int, value: int) -> None:
+    def stage_fix(self, sreg: int, value: object) -> None:
         self.apply_fix_requested.emit(sreg, value)
 
     # ---------- navigation ----------
     def _goto(self, idx: int) -> None:
         idx = max(0, min(idx, len(self._stages) - 1))
+        for other in self._stages:
+            if other is not self._stages[idx] and hasattr(other, "deactivate"):
+                other.deactivate()
         self._stack.setCurrentIndex(idx)
         stage = self._stages[idx]
         stage.reset()
@@ -844,10 +876,24 @@ class PairingWizard(QDialog):
 
     def _on_stage_complete(self) -> None:
         # When a stage completes, advance automatically — but never out of
-        # the final stage (user clicks Done).
+        # the final stage (user clicks Done), and only if the stage that
+        # completed is the one on screen (a background stage must not
+        # drag the wizard forward).
         idx = self._stack.currentIndex()
+        if self.sender() is not self._stages[idx]:
+            return
         if idx < len(self._stages) - 1:
-            QTimer.singleShot(0, lambda: self._goto(idx + 1))
+            QTimer.singleShot(
+                0, lambda: self._stack.currentIndex() == idx and self._goto(idx + 1)
+            )
+
+    def done(self, result: int) -> None:  # noqa: D401 — Qt override
+        # Accept, reject and window close all land here: stop background
+        # polling so a closed wizard can't keep driving the radio.
+        for stage in self._stages:
+            if hasattr(stage, "deactivate"):
+                stage.deactivate()
+        super().done(result)
 
     def _on_profile_saved(self, profile: Profile, path: str) -> None:
         # Pre-configure stage 4 + 5 immediately so they're ready when the

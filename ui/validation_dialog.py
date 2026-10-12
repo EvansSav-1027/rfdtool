@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from rfd.presets import Profile
-from rfd.registers import REGISTERS, RegisterDef
+from rfd.registers import FAMILY_MULTICOMM, REGISTERS, ParamValue, RegisterDef
 from rfd.validation import ValidationIssue, ValidationReport
 
 
@@ -50,8 +50,11 @@ _SEVERITY_ICONS = {
 }
 
 
-def _format_value(reg: RegisterDef | None, value: int) -> str:
+def _format_value(reg: RegisterDef | None, value: ParamValue) -> str:
     """Render a value the same way the editor would (enum label + numeric)."""
+    if isinstance(value, tuple):
+        text = ",".join(map(str, value))
+        return text if len(text) <= 48 else text[:45] + "…"
     if reg is None:
         return str(value)
     if reg.kind in ("enum", "bool") and reg.enum:
@@ -70,11 +73,13 @@ class ApplyPresetDialog(QDialog):
     def __init__(
         self,
         profile: Profile,
-        current_values: dict[int, int],
+        current_values: dict[int, ParamValue],
         *,
         board_name: str = "",
         name_to_sreg: dict[str, int] | None = None,
         sreg_to_name: dict[int, str] | None = None,
+        reg_defs: dict[int, RegisterDef] | None = None,
+        family: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -120,6 +125,19 @@ class ApplyPresetDialog(QDialog):
             warn.setWordWrap(True)
             root.addWidget(warn)
 
+        if not profile.matches_firmware(family):
+            fw = "MultiComm" if profile.firmware == FAMILY_MULTICOMM else "SiK"
+            here = "MultiComm" if family == FAMILY_MULTICOMM else "SiK"
+            warn = QLabel(
+                f"<span style='color:{_SEVERITY_COLOURS['error']};'>"
+                f"✕ This preset is written for {fw} firmware but the radio runs "
+                f"{here}. Parameter names don't carry over — most of it will be "
+                f"skipped.</span>"
+            )
+            warn.setTextFormat(Qt.TextFormat.RichText)
+            warn.setWordWrap(True)
+            root.addWidget(warn)
+
         # Diff list — walk preset by NAME and translate to the radio's sreg.
         diff_label = QLabel("<b>Changes that will be staged:</b>")
         diff_label.setTextFormat(Qt.TextFormat.RichText)
@@ -141,7 +159,7 @@ class ApplyPresetDialog(QDialog):
                 # Parameter exists in the preset but not on this firmware.
                 skipped.append(name)
                 continue
-            reg = REGISTERS.get(sreg)
+            reg = (reg_defs or REGISTERS).get(sreg)
             if reg is None or reg.read_only:
                 continue
             cur_val = current_values.get(sreg)
@@ -188,12 +206,13 @@ class ApplyPresetDialog(QDialog):
 
         # Special warning if SERIAL_SPEED will change — that breaks the
         # current connection on the next save.
-        baud_sreg = name_to_sreg.get("SERIAL_SPEED")
-        baud_new = profile.params.get("SERIAL_SPEED")
+        baud_param = "S1BAUD" if family == FAMILY_MULTICOMM else "SERIAL_SPEED"
+        baud_sreg = name_to_sreg.get(baud_param)
+        baud_new = profile.params.get(baud_param)
         if baud_sreg is not None and baud_new is not None and current_values.get(baud_sreg) != baud_new:
             note = QLabel(
                 f"<span style='color:{_SEVERITY_COLOURS['warning']};'>"
-                f"⚠ This preset changes SERIAL_SPEED. After saving, "
+                f"⚠ This preset changes {baud_param}. After saving, "
                 f"you'll need to reconnect at the new baud.</span>"
             )
             note.setTextFormat(Qt.TextFormat.RichText)
@@ -214,11 +233,14 @@ class ApplyPresetDialog(QDialog):
 class ValidationDialog(QDialog):
     """Summary of validation issues with optional click-to-fix actions."""
 
-    apply_fix_requested = Signal(int, int)  # sreg, suggested_value
+    # object, not int: suggested values may be tuples or exceed 32 bits.
+    apply_fix_requested = Signal(int, object)  # sreg, suggested_value
 
     def __init__(
         self,
         report: ValidationReport,
+        *,
+        reg_defs: dict[int, RegisterDef] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -226,6 +248,7 @@ class ValidationDialog(QDialog):
         self.setModal(True)
         self.resize(720, 540)
         self._report = report
+        self._reg_defs = reg_defs or REGISTERS
 
         root = QVBoxLayout(self)
 
@@ -256,7 +279,10 @@ class ValidationDialog(QDialog):
             root.addWidget(QLabel(
                 f"Detected band: <b>{r.name}</b> ({r.citation})"
             ))
-        elif any(s in report.issues_by_sreg for s in (8, 9)):
+        elif any(
+            {"MIN_FREQ", "MAX_FREQ", "FREQMIN", "FREQMAX"} & set(i.param_names)
+            for i in report.issues
+        ):
             root.addWidget(QLabel(
                 "<i>Detected band: none — frequency range doesn't match any known region.</i>"
             ))
@@ -332,7 +358,7 @@ class ValidationDialog(QDialog):
         if issue.suggested_value is not None and issue.sregs:
             row = QHBoxLayout()
             target_sreg = issue.sregs[0]
-            reg = REGISTERS.get(target_sreg)
+            reg = self._reg_defs.get(target_sreg)
             fix_label = QLabel(
                 issue.fix_hint
                 or f"Set S{target_sreg} to {_format_value(reg, issue.suggested_value)}."

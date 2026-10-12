@@ -71,6 +71,28 @@ REGIONS: list[Region] = [
         min_freq=902000, max_freq=928000,
         min_channels=50, max_tx_dbm=None, duty_cycle=100, lbt_rssi_min=None,
     ),
+    # 868 MHz band (RFD868x): informational entries — the regulatory limits
+    # are per sub-band / device class and don't map onto single SiK values,
+    # so no channel/power/duty numbers are enforced for them.
+    Region(
+        code="IN865",
+        name="India (865–868 MHz)",
+        citation="GSR 853(E), 10 Dec 2021",
+        min_freq=865000, max_freq=868000,
+        min_channels=None, max_tx_dbm=None, duty_cycle=None, lbt_rssi_min=None,
+        notes="Licence-exempt SRD limits: 25 mW e.r.p. at 1% duty (telemetry/"
+              "data), or 500 mW e.r.p. with APC at ≤2.5% duty (tracking/data "
+              "acquisition). Higher power needs a licence or type approval.",
+    ),
+    Region(
+        code="EU868",
+        name="EU / UK 863–870 MHz SRD",
+        citation="ETSI EN 300 220 / ERC REC 70-03 Annex 1",
+        min_freq=863000, max_freq=870000,
+        min_channels=None, max_tx_dbm=None, duty_cycle=None, lbt_rssi_min=None,
+        notes="Power and duty-cycle limits depend on the sub-band (typically "
+              "25 mW e.r.p. at 0.1–1% duty; 500 mW at 869.4–869.65 MHz, 10%).",
+    ),
     Region(
         code="EU433",
         name="EU / UK 433 MHz ISM",
@@ -126,10 +148,11 @@ def find_region(code: str) -> Region | None:
 # Per-board TX power ceilings (dBm) — based on RFDesign datasheets and
 # community-validated reports.  Boards above these limits silently clip.
 MODEL_MAX_TXPOWER: dict[str, int] = {
-    "RFD900":   20,
-    "RFD900a":  20,
-    "RFD900u":  20,
-    "RFD900p":  27,    # RFD900+ tops out at 27 dBm (≈500 mW)
+    # RFDesign rates every RFD900 variant at up to 1 W (+30 dBm).
+    "RFD900":   30,
+    "RFD900a":  30,
+    "RFD900u":  30,
+    "RFD900p":  30,
     "RFD900x":  30,
     "RFD900ux": 30,
     "RFD900x2": 30,

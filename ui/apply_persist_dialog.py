@@ -35,6 +35,13 @@ _ERR_RED = "#c0392b"
 _NEUTRAL_GREY = "#7f8c8d"
 
 
+def _fmt(value) -> str:
+    if isinstance(value, tuple):
+        text = ",".join(map(str, value))
+        return text if len(text) <= 40 else text[:37] + "…"
+    return str(value)
+
+
 class ApplyPersistDialog(QDialog):
     """Run an :class:`ApplyPersistController` and display its progress.
 
@@ -44,7 +51,8 @@ class ApplyPersistDialog(QDialog):
     reality.
     """
 
-    apply_fix_requested = Signal(int, int)
+    # object: values may be tuples (MultiComm arrays) or exceed 32 bits.
+    apply_fix_requested = Signal(int, object)
 
     def __init__(
         self,
@@ -213,22 +221,25 @@ class ApplyPersistDialog(QDialog):
                     sreg, REGISTERS[sreg].name if sreg in REGISTERS else f"S{sreg}"
                 )
                 lock_marker = " 🔒" if sreg in report.locked else ""
+                held = "nothing (not reported)" if actual is None else _fmt(actual)
                 lbl = QLabel(
                     f"<code>S{sreg:<2}</code> {name}{lock_marker}: "
-                    f"intended <b>{intended}</b>, radio holds <b>{actual}</b>"
+                    f"intended <b>{_fmt(intended)}</b>, radio holds <b>{held}</b>"
                 )
                 lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setWordWrap(True)
                 row_layout.addWidget(lbl, 1)
-                btn = QPushButton(f"Stage {actual}")
-                btn.setToolTip(
-                    f"Set the panel's S{sreg} to the radio's actual value "
-                    f"({actual}) so the panel matches reality."
-                )
-                btn.clicked.connect(
-                    lambda *, s=sreg, v=actual:
-                        self.apply_fix_requested.emit(s, v)
-                )
-                row_layout.addWidget(btn)
+                if actual is not None:
+                    btn = QPushButton("Stage radio's value")
+                    btn.setToolTip(
+                        f"Set the panel's S{sreg} to the radio's actual value "
+                        f"({_fmt(actual)}) so the panel matches reality."
+                    )
+                    btn.clicked.connect(
+                        lambda *, s=sreg, v=actual:
+                            self.apply_fix_requested.emit(s, v)
+                    )
+                    row_layout.addWidget(btn)
                 layout.addWidget(row)
 
     # -------------------------------------------------- helpers
@@ -240,3 +251,10 @@ class ApplyPersistDialog(QDialog):
             self._controller.cancel()
         else:
             self.reject()
+
+    def reject(self) -> None:  # noqa: D401 — Qt override
+        # Esc / window close mid-run: stop the pipeline rather than leaving
+        # it writing and rebooting the radio behind a closed dialog.
+        if self._controller.is_running():
+            self._controller.cancel()
+        super().reject()

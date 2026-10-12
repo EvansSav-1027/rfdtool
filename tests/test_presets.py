@@ -8,6 +8,7 @@ from rfd import presets
 from rfd.presets import (
     BUILT_IN_PRESETS,
     CATEGORY_MAXIMIZE,
+    CATEGORY_MULTICOMM,
     CATEGORY_MODEL,
     CATEGORY_REGION,
     CATEGORY_USE_CASE,
@@ -45,7 +46,8 @@ def test_built_ins_split_across_categories():
 def test_each_built_in_has_a_known_category():
     for p in BUILT_IN_PRESETS:
         assert p.category in (
-            CATEGORY_REGION, CATEGORY_USE_CASE, CATEGORY_MODEL, CATEGORY_MAXIMIZE
+            CATEGORY_REGION, CATEGORY_USE_CASE, CATEGORY_MODEL, CATEGORY_MAXIMIZE,
+            CATEGORY_MULTICOMM,
         ), f"{p.name}: bad category {p.category!r}"
 
 

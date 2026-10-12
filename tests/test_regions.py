@@ -78,10 +78,10 @@ def test_eu433_region_constraints():
 
 # -------------------------------------------------- model TX limits
 @pytest.mark.parametrize("board,expected", [
-    ("RFD900",      20),
-    ("RFD900a",     20),
-    ("RFD900u",     20),
-    ("RFD900p",     27),
+    ("RFD900",      30),
+    ("RFD900a",     30),
+    ("RFD900u",     30),
+    ("RFD900p",     30),
     ("RFD900x",     30),
     ("RFD900ux",    30),
     ("RFD900x2",    30),
@@ -93,7 +93,7 @@ def test_model_max_txpower_canonical(board, expected):
 def test_model_max_txpower_substring_match():
     # Real banner strings include the variant suffix
     assert model_max_txpower("RFD SiK 3.57 on RFD900X2-US") == 30
-    assert model_max_txpower("RFD900P-AU") == 27
+    assert model_max_txpower("RFD900P-AU") == 30
 
 
 def test_model_max_txpower_prefers_specific_match():

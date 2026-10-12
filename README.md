@@ -1,6 +1,6 @@
 # rfdtool
 
-A Linux desktop GUI for configuring [RFDesign RFD900-series](https://store.rfdesign.com.au/) radio modems running the SiK firmware. Feature parity target: the official Windows-only *RFD Modem Tools*.
+A Linux desktop GUI for configuring [RFDesign RFD900-series](https://store.rfdesign.com.au/) radio modems running the SiK firmware or RFDesign's **MultiComm** firmware (v4.x). Feature parity target: the official Windows-only *RFD Modem Tools*.
 
 Supports RFD900, RFD900+, RFD900u (8051-based, Intel HEX firmware) and RFD900x, RFD900ux, RFD900x2 (STM32-based, .bin firmware).
 
@@ -15,9 +15,23 @@ Supports RFD900, RFD900+, RFD900u (8051-based, Intel HEX firmware) and RFD900x, 
 - Side-by-side **local + remote** S-register editor with friendly labels, validated ranges, and tooltips.
 - Built-in profile presets ("MAVLink defaults", "Long range / low data rate", "Point-to-point max throughput") plus JSON profile import/export.
 - Firmware update for both 8051 and STM32 radios — Intel-HEX path uses the SiK bootloader native protocol, STM32 path wraps `stm32flash`.
-- Live RSSI / noise chart driven by either MAVLink `RADIO_STATUS` packets or `ATI7` polling (radio-button toggle).
+- Live RSSI / noise chart driven by either MAVLink `RADIO_STATUS` packets or `ATI7` polling (radio-button toggle). Polling holds the radio in command mode while the RSSI tab is open and unpaused, so the poll interval is honoured down to 0.5 s (entering command mode per poll costs ≥2.2 s); serial passthrough is paused meanwhile.
 - Raw AT terminal with command history, hex-byte sends, and timestamped log.
 - Startup environment checks that warn on `ModemManager` interference and missing `dialout` group membership.
+
+## MultiComm firmware (v4.x)
+
+RFDesign's [MultiComm firmware](https://files.rfdesign.com.au/Files/documents/MultiCommFirmwareUserManual1.0.pdf) (V2 hardware only: RFD900x2/ux2, RFD868x2/ux2) is detected automatically from the `ATI` banner or the register names in `ATI5`. It uses a completely different register map (S0–S49), and rfdtool adapts:
+
+- **Registers in sections** (Link & RF, Network & slots, Routing, Encryption, Serial 1/2, GPIO, RC). Array registers (`ENCRYPTKEY`, `RCDEFS`, `FWDTABLE`, `PINMIRR`, `PINDEFAULT`) and the 64-bit `SLOTIDS` mask get text editors; `SLOTIDS` shows which slots it owns.
+- **Ranges come from the radio.** The per-register limits it reports (e.g. `S4:NUMCHANS(N)[1..8]` on an 868 MHz unit, the allowed-function mask for each GPIO) drive the editors and validation, rather than the manual's generic table.
+- **Chunked reads**: registers are read with `ATI5:x:y` because a full `ATI5` can be truncated by the radio's UART buffer.
+- **No `AT&W`**: MultiComm saves on every write. *Save EEPROM* explains this; reboot to apply changes.
+- **Remote node selector**: `RT` commands are broadcast to every node unless addressed (`RTI5@2`). Pick a NODEID before loading/saving the REMOTE panel in a network; "all" is fine for a pair.
+- **RSSI** comes from the `AT&T=RSSI` report (MultiComm's `ATI7` is TDM timing), plotted in dBm. If no report lines appear, an `RTI` probe still tells you whether the link is up.
+- **Validation** checks the manual's rules: slot size (~300–1000 bytes), channel spacing, master owns slot 1, SLOTIDS within SLOTS, subnet bounds, pin-function conflicts, RC priority, default AES key, serial port 2 pin assignment, and more.
+- **Compare** knows which settings must match on every node, which are per-node, and flags NODEID / SLOTIDS collisions between two nodes. *Copy → Remote* copies only network-wide settings.
+- **Presets** (Profiles → MultiComm): point-to-point auto / fixed master, RC passthrough in/out, listen-only, raw serial, flow control, the manual's 4-node network, and India 865–868 MHz at 1 W EIRP for the stock monopole and dipole antennas (read the preset notes on the Indian licence-exemption limits).
 
 ## Requirements
 
@@ -50,6 +64,24 @@ Useful flags:
 .venv/bin/python rfdtool.py --no-mavlink                  # skip RADIO_STATUS parsing
 .venv/bin/python rfdtool.py --skip-checks                 # skip the startup environment checks
 ```
+
+## Flash .gbl firmware from the command line (x-series)
+
+For RFDesign x-series radios (tested on an RFD868x v2), `rfdtool.py` doubles as a headless `.gbl` flasher that replaces the manual picocom + `sx` workflow. It needs only `pyserial` and `xmodem` (no Qt):
+
+```bash
+.venv/bin/pip install pyserial xmodem
+python3 rfdtool.py --port /dev/ttyUSB0 --file firmware.gbl          # asks before flashing
+python3 rfdtool.py --port /dev/ttyUSB0 --file firmware.gbl --yes    # no prompts
+python3 rfdtool.py --port /dev/ttyUSB0 --dry-run                    # identify only
+python3 rfdtool.py --port /dev/ttyUSB0 --file firmware.gbl --batch  # radio after radio, CSV log
+```
+
+It finds the bootloader banner (`… ChipID: …`), or enters the bootloader from normal firmware with `+++` / `AT&UPDATE`. It shows the model and ChipID and asks for confirmation unless you pass `--yes`, because a file for the wrong model can brick the radio. Then it sends `UPLOAD` and transfers the file over XMODEM-CRC in 128-byte blocks with a progress bar. A failed transfer is aborted cleanly with CAN and retried, up to 3 attempts; the radio stays safely in its bootloader. On success it sends `BOOTNEW` and confirms the new firmware with `ATI`.
+
+If the radio's normal firmware runs at another baud, add `--fw-baud N`; it's used for `+++`/`AT&UPDATE` and the post-flash check, while the bootloader stays at `--baud` (57600).
+
+Exit codes: `0` ok · `1` bad file/arguments · `2` port missing, busy or permission denied · `3` no bootloader (force it in hardware: ground pad 9 while powering on) · `4` declined · `5` upload failed after retries · `6` flashed but the new firmware didn't answer · `130` interrupted.
 
 ## Build a standalone binary
 
@@ -133,7 +165,8 @@ The Firmware tab shows this hint automatically when you try to flash a `.bin` wi
 rfdtool.py                 entry point
 rfd/                       protocol + I/O (no Qt — fully unit-tested)
   registers.py             S-register definitions, ranges, tooltips
-  protocol.py              AT command builders + ATI/ATI5/ATI7 parsers
+  multicomm.py             MultiComm register catalog, RSSI report parser, slot maths
+  protocol.py              AT command builders + ATI/ATI5/ATI7 parsers (SiK + MultiComm)
   radio.py                 RadioCore (sync) + Radio (Qt wrapper, threaded)
   detector.py              port enumeration + radio fingerprinting
   ihx.py                   Intel HEX parser
@@ -141,6 +174,7 @@ rfd/                       protocol + I/O (no Qt — fully unit-tested)
   mavlink_parser.py        pymavlink RADIO_STATUS extractor
   uploader_8051.py         SiK 8051 bootloader driver
   uploader_stm32.py        stm32flash subprocess wrapper
+  gbl_flash.py             x-series .gbl flasher CLI (bootloader UPLOAD + XMODEM-CRC)
   presets.py               built-in profiles + JSON I/O
 ui/                        Qt UI layer (depends on rfd/, no reverse dep)
   main_window.py           QMainWindow assembling all tabs

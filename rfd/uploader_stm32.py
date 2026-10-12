@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from typing import Any, Callable
 
 
@@ -212,6 +213,7 @@ def upload_stm32(
                         # but a stuck flasher isn't going to come back.
                         pass
                     raise STM32FlashCancelled("user cancelled")
+                time.sleep(0.02)   # EOF before exit: don't spin a core
                 continue
 
             line = line.rstrip("\r\n")

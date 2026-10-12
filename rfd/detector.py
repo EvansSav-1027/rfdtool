@@ -1,4 +1,4 @@
-"""Serial port enumeration and radio fingerprinting.
+"""Serial port enumeration and radio fingerprinting (SiK and MultiComm).
 
 `list_serial_ports()` enumerates all USB serial adapters present, with VID/PID
 where available so the UI can highlight likely RFD900 candidates (FTDI FT231X,
@@ -79,6 +79,7 @@ class RadioFingerprint:
     freq_id: int | None
     bootloader_version: str
     linked: bool   # True if the remote radio also responded
+    firmware_family: str = "sik"   # rfd.registers.FAMILY_*
 
 
 def fingerprint_port(
@@ -101,10 +102,8 @@ def fingerprint_port(
             return None
         info = core.identify(timeout=1.0)
         # Probe for a linked remote — short timeout.
-        linked = False
         try:
-            res = core.read_params(remote=True, timeout=0.5)
-            linked = bool(res.s_params)
+            linked = core.probe_remote(timeout=0.5)
         except Exception:
             linked = False
         try:
@@ -120,6 +119,7 @@ def fingerprint_port(
             freq_id=info.get("freq_id"),  # type: ignore[arg-type]
             bootloader_version=str(info.get("bootloader_version") or ""),
             linked=linked,
+            firmware_family=core.family,
         )
     except Exception:
         return None
@@ -131,8 +131,12 @@ def fingerprint_port(
                 pass
 
 
-# Common SiK baud rates in the order most likely to be in use today.
-COMMON_BAUDS: tuple[int, ...] = (57600, 115200, 38400, 19200, 9600, 4800, 2400, 230400)
+# Common SiK/MultiComm baud rates in the order most likely to be in use
+# today.  The high rates at the end are MultiComm-only (S1BAUD up to 1.5M).
+COMMON_BAUDS: tuple[int, ...] = (
+    57600, 115200, 38400, 19200, 9600, 4800, 2400, 230400,
+    460800, 1000000, 1500000, 1200000,
+)
 
 
 def fingerprint_port_autobaud(

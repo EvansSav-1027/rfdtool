@@ -52,7 +52,7 @@ def _auto_responder(get_device_payload: bytes = bytes([0x4E, 0x43])) -> Callable
         if op == GET_SYNC:
             return bytes([INSYNC, OK])
         if op == GET_DEVICE:
-            return bytes([INSYNC]) + get_device_payload + bytes([OK])
+            return get_device_payload + bytes([INSYNC, OK])
         if op == CHIP_ERASE:
             return bytes([INSYNC, OK])
         if op == LOAD_ADDRESS:
@@ -135,7 +135,8 @@ def test_get_sync_exhausted_raises(mock_serial):
 # ---------------------------------------------------------------------------
 
 def test_get_device_parses_payload(mock_serial):
-    mock_serial.feed(bytes([INSYNC, 0x4E, 0x43, OK]))
+    # Real SiK bootloader order: board_id, freq_id, INSYNC, OK.
+    mock_serial.feed(bytes([0x4E, 0x43, INSYNC, OK]))
     board_id, freq_id = get_device(mock_serial)
     assert board_id == 0x4E
     assert freq_id == 0x43
@@ -143,7 +144,7 @@ def test_get_device_parses_payload(mock_serial):
 
 
 def test_get_device_failed_raises(mock_serial):
-    mock_serial.feed(bytes([INSYNC, 0x00, 0x00, FAILED]))
+    mock_serial.feed(bytes([0x00, 0x00, INSYNC, FAILED]))
     with pytest.raises(UploadError):
         get_device(mock_serial)
 

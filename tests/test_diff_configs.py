@@ -17,18 +17,18 @@ from rfd.diff import (
 # -------------------------------------------------- severity classification
 def test_rf_critical_names():
     for n in ("NETID", "AIR_SPEED", "MIN_FREQ", "MAX_FREQ", "NUM_CHANNELS",
-              "DUTY_CYCLE", "ECC", "MAVLINK", "MANCHESTER", "MAX_WINDOW"):
+              "DUTY_CYCLE", "ECC", "MANCHESTER", "MAX_WINDOW", "LBT_RSSI",
+              "ENCRYPTION_LEVEL"):
         assert severity_for(n) == SEVERITY_RF, n
 
 
 def test_soft_names():
-    for n in ("RTSCTS", "OPPRESEND", "LBT_RSSI", "AIR_FRAMELEN", "TXPOWER"):
+    for n in ("RTSCTS", "OPPRESEND", "MAVLINK", "AIR_FRAMELEN", "TXPOWER"):
         assert severity_for(n) == SEVERITY_SOFT, n
 
 
 def test_uart_names_explicit_and_default():
     assert severity_for("SERIAL_SPEED") == SEVERITY_UART
-    assert severity_for("ENCRYPTION_LEVEL") == SEVERITY_UART
     assert severity_for("FSFRAMELOSS") == SEVERITY_UART
     # Default for unknown
     assert severity_for("UNKNOWN_FUTURE_PARAM") == SEVERITY_UART
