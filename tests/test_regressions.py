@@ -159,6 +159,7 @@ def test_typed_ato_returns_to_data_mode(qapp, mock_serial):
     radio = Radio(serial_factory=lambda p, b, t: mock_serial, mavlink_parsing=False)
     radio._core = RadioCore(mock_serial)
     radio._state = Radio.STATE_COMMAND
+    radio._core.last_command_at = time.monotonic()    # just entered
     mock_serial.script(b"ATO", b"OK\r\n")
     radio.send_raw_at("ATO").result(timeout=5)
     assert radio._state == Radio.STATE_DATA and not radio._hold_command
@@ -169,6 +170,7 @@ def test_terminal_hold_survives_background_ops(qapp, mock_serial):
     radio = Radio(serial_factory=lambda p, b, t: mock_serial, mavlink_parsing=False)
     radio._core = RadioCore(mock_serial)
     radio._state = Radio.STATE_COMMAND
+    radio._core.last_command_at = time.monotonic()    # just entered
     mock_serial.script(b"ATI\r\n", b"SiK\r\nOK\r\n")
     radio.send_raw_at("ATI").result(timeout=5)
     mock_serial.script(b"ATI7", b"L/R RSSI: 1/2\r\nOK\r\n")
@@ -515,3 +517,62 @@ def test_remote_layout_matches_local_for_raw_names(tab, mc_dump):
     tab._on_params_loaded(replace(raw, family=FAMILY_MULTICOMM), True)
     assert tab._remote_panel.sreg_to_name() == tab._local_panel.sreg_to_name()
     assert tab._remote_panel.sreg_to_name()[46] == "PINMIRROR"
+
+
+def test_stale_command_mode_is_reentered(qapp, mock_serial, session_radio):
+    # The radio can drop out of command mode while we sit idle (e.g. a
+    # MultiComm RSSI session sends nothing).  Commands must not then go out
+    # as over-the-air data: probe with AT, re-enter with +++.
+    radio = session_radio
+    radio._state = Radio.STATE_COMMAND
+    radio._core.last_command_at = time.monotonic() - 10   # long idle
+    mock_serial.script(b"ATI\r\n", b"SiK\r\nOK\r\n")    # no reply to bare AT
+    radio.send_raw_at("ATI").result(timeout=5)
+    w = bytes(mock_serial.written)
+    assert w.index(b"AT\r\n") < w.index(b"+++") < w.index(b"ATI\r\n")
+
+
+def test_fresh_command_mode_skips_probe(qapp, mock_serial, session_radio):
+    radio = session_radio
+    radio._state = Radio.STATE_COMMAND
+    radio._core.last_command_at = time.monotonic()
+    mock_serial.script(b"ATI\r\n", b"SiK\r\nOK\r\n")
+    radio.send_raw_at("ATI").result(timeout=5)
+    assert bytes(mock_serial.written) == b"ATI\r\n"
+
+
+def test_terminal_reasserts_command_mode_when_shown(qapp):
+    from ui.terminal_tab import TerminalTab
+
+    class _R(QObject):
+        rx_data = Signal(bytes)
+        at_response = Signal(str, str, bool)
+        error = Signal(str)
+        state_changed = Signal(str)
+        log = Signal(str, int)
+
+        def __init__(self):
+            super().__init__()
+            self.sent: list[str] = []
+
+        def send_raw_at(self, cmd):
+            self.sent.append(cmd)
+
+        def back_to_data(self):
+            pass
+
+    radio = _R()
+    tab = TerminalTab(radio)
+    radio.state_changed.emit(Radio.STATE_DATA)
+    tab._cmd_btn.setChecked(True)          # user turned Command Mode on
+    radio.sent.clear()
+    tab.hide()
+    tab.show()                              # e.g. back from the RSSI tab
+    qapp.processEvents()
+    assert radio.sent == ["AT"]
+    tab._cmd_btn.setChecked(False)
+    radio.sent.clear()
+    tab.hide()
+    tab.show()
+    assert radio.sent == []                 # off: leave passthrough alone
+    tab.close()

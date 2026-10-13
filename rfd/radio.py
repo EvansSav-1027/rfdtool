@@ -95,6 +95,8 @@ class RadioCore:
         # connection from the local radio and reused for the remote panel.
         self._meta_cache: dict[int, ParamMeta] = {}
         self._meta_fetched = False
+        # monotonic time of the last command exchange; see probe_command_mode
+        self.last_command_at = 0.0
 
     @property
     def serial(self) -> _SerialLike:
@@ -157,6 +159,7 @@ class RadioCore:
                 ):
                     break
                 time.sleep(0.005)
+        self.last_command_at = time.monotonic()
         return out.decode("ascii", errors="replace")
 
     @staticmethod
@@ -187,6 +190,7 @@ class RadioCore:
                 out.extend(chunk)
             else:
                 time.sleep(0.01)
+        self.last_command_at = time.monotonic()
         return out.decode("ascii", errors="replace")
 
     # ---------------------------------------- command-mode bracket
@@ -221,6 +225,7 @@ class RadioCore:
                 if chunk:
                     post_plus.extend(chunk)
                     if _has_ok(post_plus.decode("ascii", errors="replace")):
+                        self.last_command_at = time.monotonic()
                         return True
                 else:
                     if post_plus:
@@ -235,6 +240,34 @@ class RadioCore:
             return _has_ok(reply) or bool(
                 re.search(r"\b(SiK|RFD\w*|MultiComm)\b", reply)
             )
+
+    def probe_command_mode(self, timeout: float = 0.6) -> bool:
+        """Is the radio still in command mode?  Sends a bare ``AT``.
+
+        Doesn't flush the input first, and keeps whatever it read in the
+        RSSI-report buffer, so a streaming AT&T=RSSI session loses no lines.
+        """
+        with self.lock:
+            self._ser.write(b"AT\r\n")
+            try:
+                self._ser.flush()
+            except Exception:
+                pass
+            deadline = time.monotonic() + timeout
+            out = bytearray()
+            while time.monotonic() < deadline:
+                n = self._ser.in_waiting
+                chunk = self._ser.read(n if n > 0 else 1)
+                if chunk:
+                    out.extend(chunk)
+                    if _has_ok(out.decode("ascii", errors="replace")):
+                        break
+                else:
+                    time.sleep(0.005)
+            text = out.decode("ascii", errors="replace")
+            self._rssi_text = getattr(self, "_rssi_text", "") + text
+            self.last_command_at = time.monotonic()
+            return _has_ok(text)
 
     def exit_command_mode(self) -> bool:
         with self.lock:
@@ -618,6 +651,10 @@ class Radio(QObject):
     STATE_COMMAND = "command"      # +++ bracket open
     STATE_BOOTLOADER = "bootloader"
 
+    # After this long without any command exchange, verify command mode with
+    # a bare AT before trusting it.
+    COMMAND_STALE_S = 2.0
+
     # ---- signals (delivered to UI thread via queued connections) ----
     connected = Signal(str, int)            # port, baud
     disconnected = Signal(str)              # reason
@@ -778,7 +815,21 @@ class Radio(QObject):
             self.error.emit("not connected")
             return False
         if self._state == self.STATE_COMMAND:
-            return True
+            # We think we're in command mode — but after a quiet spell the
+            # radio may have left it (e.g. a MultiComm RSSI session sends
+            # nothing between polls).  Commands sent then would go over the
+            # air as data.  Probe with AT; re-enter with +++ if it's gone.
+            idle = time.monotonic() - self._core.last_command_at
+            if idle < self.COMMAND_STALE_S:
+                return True
+            try:
+                if self._core.probe_command_mode():
+                    return True
+            except Exception as e:
+                self.error.emit(f"serial port error: {e}")
+                return False
+            self.log.emit("radio left command mode — re-entering (+++)", 1)
+            self._rssi_report_on = False
         self._stop_read_pump()
         try:
             ok = self._core.enter_command_mode()

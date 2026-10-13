@@ -140,6 +140,7 @@ class TerminalTab(QWidget):
         self._history: list[str] = []
         self._command_mode_active = False
         self._suppressed_scroll = False
+        self._radio_state = Radio.STATE_DISCONNECTED
 
         # ---- log area ----------------------------------------------------
         self._log = QTextEdit(self)
@@ -297,6 +298,18 @@ class TerminalTab(QWidget):
             except Exception as e:
                 self._append_note(f"back_to_data failed: {e}", self._COLOR_ERR)
 
+    # ---------------------------------------------------------- visibility
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().showEvent(event)
+        # Other tabs (an RSSI session, Load Settings…) may have taken the
+        # radio out of command mode.  If Command Mode is on, re-assert it so
+        # the next typed command works first time; the OK shows it's live.
+        if (
+            self._cmd_btn.isChecked()
+            and self._radio_state in (Radio.STATE_DATA, Radio.STATE_COMMAND)
+        ):
+            self._radio.send_raw_at("AT")
+
     # ---------------------------------------------------------- radio signals
     def _on_rx_data(self, data: bytes) -> None:
         if not data:
@@ -332,6 +345,7 @@ class TerminalTab(QWidget):
         self._append_note(text, colour)
 
     def _on_state_changed(self, state: str) -> None:
+        self._radio_state = state
         connected = state != Radio.STATE_DISCONNECTED
         self._set_widgets_enabled(connected)
         self._append_note(f"[state: {state}]", self._COLOR_NOTE)
