@@ -133,7 +133,10 @@ def test_meta_drives_ranges_and_options(dump):
         return derive_def(s, names[s], family=FAMILY_MULTICOMM, meta=dump.s_meta[s])
 
     assert d(4).maximum == 8                      # 868 MHz: NUMCHANS 1..8
-    assert sorted(d(1).enum) == [56, 64, 72, 100, 125, 188, 200]
+    # The option list wins over the printed range: a real radio reports
+    # BITRATE [56..200] while running at 430.
+    assert sorted(d(1).enum) == [12, 56, 64, 72, 100, 125, 188, 200, 430, 1000, 2000]
+    assert d(1).minimum == 56 and d(1).maximum == 200
     assert d(18).enum == {1: "Low", 2: "Medium", 3: "High (RC input)"}
     assert set(d(36).enum) == {0, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 23}
     assert d(9).kind == "bitmask"

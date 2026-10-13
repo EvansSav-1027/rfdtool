@@ -211,8 +211,11 @@ def test_out_of_range_values_are_reported(mc_dump):
     cfg = {**mc_dump.s_params, 30: 99, 10: 70}
     titles = _mc_titles(cfg, mc_dump.s_names, mc_dump.s_meta)
     assert "TXPOWER out of range" in titles and "NODEID out of range" in titles
-    cfg = {**mc_dump.s_params, 1: 1000}          # radio allows 56..200
+    cfg = {**mc_dump.s_params, 1: 999}           # not in the radio's option list
     assert "BITRATE out of range" in _mc_titles(cfg, mc_dump.s_names, mc_dump.s_meta)
+    # 430 is in the option list; a real radio runs at it despite [56..200].
+    cfg = {**mc_dump.s_params, 1: 430}
+    assert "BITRATE out of range" not in _mc_titles(cfg, mc_dump.s_names, mc_dump.s_meta)
 
 
 def test_subnet_fix_targets_subnets(mc_dump):

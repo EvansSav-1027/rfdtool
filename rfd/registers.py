@@ -121,11 +121,12 @@ class ParamMeta:
         numeric = all(o.lstrip("-").isdigit() for o in self.options)
         out: dict[int, str] = {}
         if numeric and self.type_code == "N":
-            # Option list is the value set itself (BITRATE, S1BAUD).
+            # The option list is the value set itself (BITRATE, S1BAUD).  The
+            # printed [min..max] is NOT a hard limit for these: a v4.00
+            # RFD868x2 reports BITRATE [56..200] yet runs at 430, which is in
+            # its option list.  So don't filter the list by the range.
             for o in self.options:
-                v = int(o)
-                if v >= lo and (hi is None or v <= hi):
-                    out[v] = o
+                out[int(o)] = o
             return out
         # Labels: index = value, except when there is exactly one label per
         # value in a range not starting at 0 (PRI 1..3 = Low/Med/High).
